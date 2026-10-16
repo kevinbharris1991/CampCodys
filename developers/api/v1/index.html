@@ -56,13 +56,20 @@ Name is nonempty text up to 120 characters; gender must be one of <code>female</
 Date of birth is a real YYYY-MM-DD date between 1900-01-01 and today (UTC).
 Each acceptance must independently be the JSON boolean <code>true</code>; separate acceptance timestamps are retained.
 The response is always the same eligibility-neutral <code>{"message":"..."}</code> for valid new or duplicate addresses.
-Duplicate live registrations are not reset or resent. Expired incomplete registrations can be restarted.</li>
+For an incomplete account, re-registration sends a fresh activation/recovery link without changing stored demographics,
+consent, username, password or authenticator. Existing unconsumed email links remain valid until their own expiry or a successful activation;
+an unauthenticated sender cannot invalidate an earlier email link or reset established credentials. Completed accounts receive the same
+generic response but no enrollment link. Requests are limited to three per address per hour and ten per network address per hour.</li>
 <li>The configured PHP mail transport sends a 24-hour link to the fixed configured portal origin:
 <code>https://your-camp-host/public/?activate=&lt;token&gt;</code>.
 The portal submits <code>{"token":"&lt;token&gt;"}</code> to <code>POST /auth/activate</code>.
-The single-use activation token is exchanged for <code>{"onboarding_token":"&lt;token&gt;"}</code>.
+The single-use activation token is exchanged for
+<code>{"onboarding_token":"&lt;token&gt;","next_step":"profile"}</code>, or <code>next_step:"mfa"</code> when recovering an already-established profile.
+For <code>mfa</code>, call <code>/auth/mfa/setup</code> with the new onboarding token and show the existing authenticator setup;
+do not submit a new profile or password. Successful activation invalidates sibling activation links and any previous onboarding capability.
 The onboarding capability expires after 24 hours and is bound to the API client used for activation;
-it never authorizes record/session endpoints. Keep it only in protected server-side portal session storage.</li>
+it never authorizes record/session endpoints. Keep it only in protected server-side portal session storage.
+If the browser session is lost or expires, use the registration form again and follow the newly emailed recovery link.</li>
 <li><code>POST /auth/profile</code>:
 <pre>{"onboarding_token":"&lt;token&gt;","username":"alex.example",
  "password":"&lt;12-1024 byte password&gt;","password_confirmation":"&lt;same password&gt;"}</pre>
@@ -97,10 +104,13 @@ An accepted transport handoff does not guarantee mailbox delivery.</p>
 Like its existing <code>PORTAL_API_*</code> credentials, these portal settings must be set in the portal process environment, not only in <code>.env</code>.
 Without both valid policy URLs, the portal hides the registration form rather than requesting acceptance of missing policies.</p>
 <p>Existing installations must rerun <code>php bin/console.php setup</code> with the migration identity before deploying new code.
-Schema changes are additive: <code>account_onboarding</code> and <code>mfa_challenges</code>; existing users and memberships are not migrated or changed.
-Grant the runtime account SELECT/INSERT/UPDATE/DELETE on both new tables and INSERT on users/memberships for final Guest creation,
+Schema changes are additive: <code>account_onboarding</code>, <code>onboarding_activation_tokens</code> and <code>mfa_challenges</code>;
+existing users and memberships are not migrated or changed.
+Grant the runtime account SELECT/INSERT/UPDATE/DELETE on all three new tables and INSERT on users/memberships for final Guest creation,
 in addition to existing runtime grants. Keep role-management policy CLI-only and deny runtime UPDATE/DELETE on audit_events.
-Schedule <code>php bin/console.php cleanup</code> to remove expired incomplete registrations, challenges, and existing expired operational data.
+Schedule <code>php bin/console.php cleanup</code> to remove expired activation links, challenges, and existing expired operational data.
+Incomplete encrypted registrations remain recoverable until their onboarding capability has been expired for over 30 days;
+cleanup then removes them only when no unexpired recovery link exists. This bounded recovery-retention window does not extend token validity.
 Completed encrypted profiles, consent dates, and MFA secrets are retained; establish an approved retention and recovery policy.</p>
 <p>Name, birth date, gender, photo and TOTP secrets are encrypted with the application key using authenticated sodium secretbox encryption.
 The public display name for new accounts is their username; email, username, consent timestamps and ownership/stage metadata are not encrypted.

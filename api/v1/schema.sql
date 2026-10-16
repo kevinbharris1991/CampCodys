@@ -136,3 +136,11 @@ CREATE TABLE IF NOT EXISTS mfa_challenges (
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (client_id) REFERENCES api_clients(id)
 ) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS onboarding_activation_tokens (
+    token_hash CHAR(64) PRIMARY KEY,
+    account_id BIGINT UNSIGNED NOT NULL,
+    expires_at DATETIME NOT NULL,
+    INDEX (account_id),
+    INDEX (expires_at),
+    FOREIGN KEY (account_id) REFERENCES account_onboarding(id) ON DELETE CASCADE
+) ENGINE=InnoDB;

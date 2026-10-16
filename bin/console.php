@@ -29,10 +29,11 @@ Client scopes are explicit resource names, or the deliberately privileged litera
 Setup requires a pre-created MySQL database and DDL privileges. Runtime should use a
 separate account with SELECT/INSERT/UPDATE/DELETE only; deny UPDATE/DELETE on audit_events.
 Use a restricted local account for operations; public registration grants Guest only.
-Runtime needs CRUD on account_onboarding and mfa_challenges as well as existing tables.
+Runtime needs CRUD on account_onboarding, onboarding_activation_tokens and mfa_challenges.
 Keep stdout credentials private, not in shell logs, browser source, or version control.
 All record payloads are encrypted. Back up the encryption key separately from the database.
-CLI cleanup removes expired rate buckets, MFA challenges, incomplete registrations,
+CLI cleanup removes expired rate buckets, MFA challenges, activation links, incomplete
+registrations with onboarding expired over 30 days ago (unless a live recovery link exists),
 and sessions expired/revoked over 30 days ago. Completed profiles and consent dates remain.
 seed-task preloads only sanitation, sensory_setup, safety_notices, emergency_plans,
 or emergency_alerts for teams with read/update access. It cannot provision camper data.
@@ -225,7 +226,8 @@ try {
         case 'cleanup':
             $query('DELETE FROM rate_limits WHERE expires_at < UTC_TIMESTAMP()');
             $query('DELETE FROM mfa_challenges WHERE expires_at <= UTC_TIMESTAMP()');
-            $query("DELETE FROM account_onboarding WHERE stage <> 'complete' AND expires_at <= UTC_TIMESTAMP()");
+            $query('DELETE FROM onboarding_activation_tokens WHERE expires_at <= UTC_TIMESTAMP()');
+            $query("DELETE FROM account_onboarding WHERE stage <> 'complete' AND expires_at < UTC_TIMESTAMP() - INTERVAL 30 DAY AND NOT EXISTS (SELECT 1 FROM onboarding_activation_tokens t WHERE t.account_id = account_onboarding.id)");
             $query('DELETE FROM sessions WHERE expires_at < UTC_TIMESTAMP() - INTERVAL 30 DAY OR revoked_at < UTC_TIMESTAMP() - INTERVAL 30 DAY');
             $audit('cleanup');
             $result = ['cleaned' => true];

@@ -72,7 +72,7 @@ try {
     $size = filesize($mailCapture);
     expect(authCall('register', $registration) === $generic, 'duplicate pending email is generic');
     clearstatcache(true, $mailCapture);
-    expect(filesize($mailCapture) === $size, 'duplicate registration does not overwrite token or resend email');
+    expect(filesize($mailCapture) > $size, 'duplicate registration sends a recovery link without invalidating earlier links');
     expect(authCall('register', array_replace($registration, ['email' => 'role1@example.test'])) === $generic, 'existing operator email is generic');
     $pending = $db->query("SELECT * FROM account_onboarding WHERE email = 'new-guest@example.test'")->fetch();
     expect($pending['activation_hash'] === hash('sha256', $activation) && !str_contains(json_encode($pending), $activation), 'activation token stored only as hash');
@@ -81,7 +81,9 @@ try {
     authCall('profile', ['onboarding_token' => $activation, 'username' => 'newguest', 'password' => $password, 'password_confirmation' => $password], 401);
     authCall('mfa/confirm', ['onboarding_token' => $activation, 'code' => '000000'], 401);
     authCall('login', ['email' => $registration['email'], 'password' => $password], 401);
-    $onboarding = authCall('activate', ['token' => $activation])['onboarding_token'];
+    $activated = authCall('activate', ['token' => $activation]);
+    expect($activated['next_step'] === 'profile', 'first activation identifies profile as next step');
+    $onboarding = $activated['onboarding_token'];
     authCall('activate', ['token' => $activation], 401);
     expect($db->query("SELECT activation_hash FROM account_onboarding WHERE email = 'new-guest@example.test'")->fetchColumn() === null, 'activation consumed atomically');
     $onboardingRow = $db->query("SELECT * FROM account_onboarding WHERE email = 'new-guest@example.test'")->fetch();
@@ -148,6 +150,10 @@ try {
     authCall('mfa/verify', ['mfa_token' => $challenge3, 'code' => $nextCode], 401);
     api('GET', '/auth/me', $session2['access_token'], null, 401);
     expect(isset(authCall('login', ['email' => 'newguest', 'password' => $password])['mfa_token']), 'password rotation preserves MFA requirement');
+    expect((int) $db->query("SELECT COUNT(*) FROM sessions WHERE user_id = $userId AND revoked_at IS NULL")->fetchColumn() === 0,
+        'operator password reset cannot issue an MFA-bypassing session');
+    expect(\Camp\decryptPayload($db->query("SELECT profile FROM account_onboarding WHERE user_id = $userId")->fetchColumn(), $key)['mfa_secret'] === $details['mfa_secret'],
+        'operator password reset never resets enrolled authenticator');
     expect(isset(authCall('login', ['email' => 'role1@example.test', 'password' => $password])['access_token']), 'legacy operator password login preserved');
     [$secondFields, $secondActivation] = signupFixture('other-signup@example.test');
     $secondToken = authCall('activate', ['token' => $secondActivation])['onboarding_token'];
@@ -178,11 +184,27 @@ try {
         'rollback preserves enrollment stage but cannot roll back MFA failure budget');
     $db->prepare('UPDATE account_onboarding SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE onboarding_hash = ?')->execute([hash('sha256', $secondToken)]);
     authCall('mfa/setup', ['onboarding_token' => $secondToken], 401);
+    $beforeRecovery = $db->query("SELECT * FROM account_onboarding WHERE email = 'other-signup@example.test'")->fetch();
+    [$ignoredFields, $recoveryLink] = signupFixture('other-signup@example.test');
+    $afterRecovery = $db->query("SELECT * FROM account_onboarding WHERE email = 'other-signup@example.test'")->fetch();
+    expect($beforeRecovery === $afterRecovery, 're-registration preserves established credentials, demographic data, consent, stage and expiry');
+    $resumed = authCall('activate', ['token' => $recoveryLink]);
+    expect($resumed['next_step'] === 'mfa' && $resumed['onboarding_token'] !== $secondToken, 'email recovery replaces expired browser capability and resumes MFA');
+    expect(authCall('mfa/setup', ['onboarding_token' => $resumed['onboarding_token']]) === $secondDetails, 'recovery returns the existing authenticator secret');
+    authCall('profile', array_replace($profileBody, ['onboarding_token' => $resumed['onboarding_token'], 'username' => 'attackerreset']), 409);
+    authCall('activate', ['token' => $recoveryLink], 401);
+    $db->exec("UPDATE account_onboarding SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE email = 'other-signup@example.test'");
+    [$ignoredFields2, $recoveryLink2] = signupFixture('other-signup@example.test');
+    [$cleanupCode] = cli(['cleanup']);
+    expect($cleanupCode === 0 && (int) $db->query("SELECT COUNT(*) FROM account_onboarding WHERE email = 'other-signup@example.test'")->fetchColumn() === 1,
+        'cleanup retains expired onboarding for the recovery-retention window');
+    expect(authCall('activate', ['token' => $recoveryLink2])['next_step'] === 'mfa', 'recovery remains possible after expired-onboarding cleanup');
     [$expiredFields, $expiredActivation] = signupFixture('expired-signup@example.test');
     $db->prepare('UPDATE account_onboarding SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE activation_hash = ?')->execute([hash('sha256', $expiredActivation)]);
+    $db->prepare('UPDATE onboarding_activation_tokens SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE token_hash = ?')->execute([hash('sha256', $expiredActivation)]);
     authCall('activate', ['token' => $expiredActivation], 401);
     [$retryFields, $replacementActivation] = signupFixture('expired-signup@example.test');
-    expect($replacementActivation !== $expiredActivation, 'expired pending registration can restart without resetting a live profile');
+    expect($replacementActivation !== $expiredActivation, 'expired activation can obtain a fresh link without resetting profile');
     authCall('activate', ['token' => $expiredActivation], 401);
     [$raceFields, $raceActivation] = signupFixture('concurrent-signup@example.test');
     $activationRace = authRace('activate', ['token' => $raceActivation]);
@@ -203,7 +225,8 @@ try {
     expect(array_column($verifyRace, 0) === [200, 401], 'concurrent MFA challenge replay has exactly one winner');
     expect((int) $db->query('SELECT COUNT(*) FROM sessions')->fetchColumn() === $raceSessionsBefore + 1,
         'concurrent challenge replay mints only one session');
-    $db->exec("UPDATE account_onboarding SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE stage <> 'complete'");
+    $db->exec("UPDATE account_onboarding SET expires_at = UTC_TIMESTAMP() - INTERVAL 31 DAY WHERE stage <> 'complete'");
+    $db->exec('UPDATE onboarding_activation_tokens SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND');
     $db->exec('UPDATE mfa_challenges SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND');
     [$code] = cli(['cleanup']);
     expect($code === 0 && (int) $db->query("SELECT COUNT(*) FROM account_onboarding WHERE stage <> 'complete'")->fetchColumn() === 0, 'CLI cleanup purges expired incomplete profiles');

@@ -108,25 +108,31 @@ trait RegistrationAuth
         $this->rate('registration-email:' . hash_hmac('sha256', $email, $this->config['key']), 3, 3600);
         $message = ['message' => 'If this address is eligible, an activation email will arrive shortly.'];
         $this->db->beginTransaction();
-        $this->execute("DELETE FROM account_onboarding WHERE email = ? AND stage <> 'complete' AND expires_at <= UTC_TIMESTAMP()", [$email]);
-        if ($this->execute('SELECT id FROM users WHERE email = ?', [$email])->fetchColumn()
-            || $this->execute('SELECT id FROM account_onboarding WHERE email = ?', [$email])->fetchColumn()) {
+        $row = $this->execute('SELECT * FROM account_onboarding WHERE email = ? FOR UPDATE', [$email])->fetch();
+        if (($row && $row['stage'] === 'complete') || $this->execute('SELECT id FROM users WHERE email = ?', [$email])->fetchColumn()) {
             $this->db->commit();
             return $message;
         }
         $token = bin2hex(random_bytes(32));
-        $profile = ['name' => trim($body['name']), 'date_of_birth' => $dob, 'gender' => trim($body['gender'])];
-        try {
-            $this->execute('INSERT INTO account_onboarding (email, profile, activation_hash, expires_at, terms_accepted_at, privacy_accepted_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())', [
-                $email, encryptPayload($profile, $this->config['key']), hash('sha256', $token), gmdate('Y-m-d H:i:s', time() + 86400),
-            ]);
-        } catch (\PDOException $error) {
-            if ($error->getCode() !== '23000') {
-                throw $error;
+        if (!$row) {
+            $profile = ['name' => trim($body['name']), 'date_of_birth' => $dob, 'gender' => $body['gender']];
+            try {
+                $this->execute('INSERT INTO account_onboarding (email, profile, activation_hash, expires_at, terms_accepted_at, privacy_accepted_at) VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())', [
+                    $email, encryptPayload($profile, $this->config['key']), hash('sha256', $token), gmdate('Y-m-d H:i:s', time() + 86400),
+                ]);
+            } catch (\PDOException $error) {
+                if ($error->getCode() !== '23000') {
+                    throw $error;
+                }
+                $this->db->rollBack();
+                return $message;
             }
-            $this->db->rollBack();
-            return $message;
+            $row = ['id' => (int) $this->db->lastInsertId()];
         }
+        // Resends add a capability; they never reset credentials, secrets, consent or older valid links.
+        $this->execute('INSERT INTO onboarding_activation_tokens (token_hash, account_id, expires_at) VALUES (?, ?, ?)', [
+            hash('sha256', $token), $row['id'], gmdate('Y-m-d H:i:s', time() + 86400),
+        ]);
         // Never derive an activation origin from Host, forwarded headers, or submitted data.
         $link = $this->config['APP_PUBLIC_URL'] . '?activate=' . $token;
         if (!mail($email, "Activate your Camp Cody's account",
@@ -146,17 +152,27 @@ trait RegistrationAuth
         $this->authFields($body, ['token']);
         $hash = $this->authToken($body, 'token');
         $this->db->beginTransaction();
-        $row = $this->execute("SELECT * FROM account_onboarding WHERE activation_hash = ? AND stage = 'pending' AND expires_at > UTC_TIMESTAMP() FOR UPDATE", [$hash])->fetch();
-        if (!$row) {
+        $id = $this->execute('SELECT account_id FROM onboarding_activation_tokens WHERE token_hash = ?', [$hash])->fetchColumn();
+        // Also accept unconsumed links issued before the additive recovery-token migration.
+        if (!$id) {
+            $id = $this->execute('SELECT id FROM account_onboarding WHERE activation_hash = ?', [$hash])->fetchColumn();
+        }
+        $row = $id ? $this->execute('SELECT * FROM account_onboarding WHERE id = ? FOR UPDATE', [$id])->fetch() : false;
+        $link = $row ? $this->execute('SELECT token_hash FROM onboarding_activation_tokens WHERE token_hash = ? AND account_id = ? AND expires_at > UTC_TIMESTAMP() FOR UPDATE', [$hash, $row['id']])->fetchColumn() : false;
+        $legacyLink = $row && $row['stage'] === 'pending' && hash_equals($row['activation_hash'] ?? '', $hash)
+            && $row['expires_at'] > gmdate('Y-m-d H:i:s');
+        if (!$row || $row['stage'] === 'complete' || (!$link && !$legacyLink)) {
             throw new ApiError(401, 'Invalid or expired activation token; register again after expiry');
         }
         $token = bin2hex(random_bytes(32));
-        $this->execute("UPDATE account_onboarding SET stage = 'activated', activation_hash = NULL, onboarding_hash = ?, client_id = ?, expires_at = ? WHERE id = ?", [
-            hash('sha256', $token), $this->client['id'], gmdate('Y-m-d H:i:s', time() + 86400), $row['id'],
+        $next = $row['stage'] === 'profile' ? 'mfa' : 'profile';
+        $this->execute('UPDATE account_onboarding SET stage = ?, activation_hash = NULL, onboarding_hash = ?, client_id = ?, expires_at = ? WHERE id = ?', [
+            $next === 'mfa' ? 'profile' : 'activated', hash('sha256', $token), $this->client['id'], gmdate('Y-m-d H:i:s', time() + 86400), $row['id'],
         ]);
+        $this->execute('DELETE FROM onboarding_activation_tokens WHERE account_id = ?', [$row['id']]);
         $this->audit('auth.activate');
         $this->db->commit();
-        return ['onboarding_token' => $token];
+        return ['onboarding_token' => $token, 'next_step' => $next];
     }
 
     private function onboarding(array $body): array
@@ -282,6 +298,7 @@ trait RegistrationAuth
         $id = (int) $this->db->lastInsertId();
         $this->execute('INSERT INTO memberships (user_id, role_id) VALUES (?, 12)', [$id]);
         $this->execute("UPDATE account_onboarding SET stage = 'complete', user_id = ?, onboarding_hash = NULL, password_hash = NULL, last_totp_step = ? WHERE id = ?", [$id, $step, $row['id']]);
+        $this->execute('DELETE FROM onboarding_activation_tokens WHERE account_id = ?', [$row['id']]);
         $this->user = ['id' => $id];
         $result = $this->issueSession();
         $this->audit('auth.mfa.confirm');
