@@ -12,13 +12,6 @@ final class ApiError extends \RuntimeException
     {
         parent::__construct($message);
     }
-    foreach (['APP_PUBLIC_URL', 'APP_MAIL_FROM'] as $name) {
-        $value = getenv($name);
-        if ($value !== false) {
-            $values[$name] = $value;
-        }
-        $values[$name] ??= '';
-    }
 }
 
 function config(?string $root = null): array
@@ -50,6 +43,13 @@ function config(?string $root = null): array
             throw new \RuntimeException('Missing configuration');
         }
     }
+    foreach (['APP_PUBLIC_URL', 'APP_MAIL_FROM'] as $name) {
+        $value = getenv($name);
+        if ($value !== false) {
+            $values[$name] = $value;
+        }
+        $values[$name] ??= '';
+    }
     $key = base64_decode($values['APP_ENCRYPTION_KEY'], true);
     if ($key === false || strlen($key) !== SODIUM_CRYPTO_SECRETBOX_KEYBYTES
         || count(array_unique(str_split($key))) < 8
@@ -70,7 +70,7 @@ function config(?string $root = null): array
     if ($values['APP_PUBLIC_URL'] !== '' || $values['APP_MAIL_FROM'] !== '') {
         $url = parse_url($values['APP_PUBLIC_URL']);
         if (!$url || !filter_var($values['APP_PUBLIC_URL'], FILTER_VALIDATE_URL)
-            || !isset($url['host'], $url['scheme']) || isset($url['user'], $url['pass'])
+            || !isset($url['host'], $url['scheme']) || isset($url['user']) || isset($url['pass'])
             || isset($url['query']) || isset($url['fragment']) || ($url['path'] ?? '') !== '/public/'
             || preg_match('/[\x00-\x20\x7f]/', $values['APP_PUBLIC_URL'])
             || !in_array($url['scheme'], ['https', 'http'], true)

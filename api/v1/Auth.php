@@ -151,8 +151,8 @@ trait RegistrationAuth
             throw new ApiError(401, 'Invalid or expired activation token; register again after expiry');
         }
         $token = bin2hex(random_bytes(32));
-        $this->execute("UPDATE account_onboarding SET stage = 'activated', activation_hash = NULL, onboarding_hash = ?, expires_at = ? WHERE id = ?", [
-            hash('sha256', $token), gmdate('Y-m-d H:i:s', time() + 86400), $row['id'],
+        $this->execute("UPDATE account_onboarding SET stage = 'activated', activation_hash = NULL, onboarding_hash = ?, client_id = ?, expires_at = ? WHERE id = ?", [
+            hash('sha256', $token), $this->client['id'], gmdate('Y-m-d H:i:s', time() + 86400), $row['id'],
         ]);
         $this->audit('auth.activate');
         $this->db->commit();
@@ -180,7 +180,7 @@ trait RegistrationAuth
     private function saveProfile(): array
     {
         $this->rate('profile:' . $this->addressHash, 30, 900);
-        $body = $this->body(393216);
+        $body = $this->body(786432);
         $this->authFields($body, ['onboarding_token', 'username', 'password', 'password_confirmation'], ['profile_picture']);
         $this->db->beginTransaction();
         $row = $this->onboarding($body);
@@ -271,7 +271,7 @@ trait RegistrationAuth
         }
         try {
             $this->execute('INSERT INTO users (email, display_name, password_hash) VALUES (?, ?, ?)', [
-                $row['email'], $profile['name'], $row['password_hash'],
+                $row['email'], $row['username'], $row['password_hash'],
             ]);
         } catch (\PDOException $error) {
             if ($error->getCode() === '23000') {

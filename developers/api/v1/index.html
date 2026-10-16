@@ -16,7 +16,8 @@
 <h2>Scope and readiness</h2>
 <p>This is an API foundation, not a certified electronic health record, payment processor, or complete camp management product.
 It supplies authentication, database-backed group membership, a resource permission matrix, scoped CRUD, and guest meal/activity views.
-Clinical review, MFA/identity-provider integration, business approvals, operational monitoring, and independent security testing are production prerequisites.</p>
+Clinical review, privileged-operator MFA/identity-provider integration, business approvals, operational monitoring, and independent security testing are production prerequisites.
+Self-registered accounts use mandatory native TOTP; existing operator accounts retain their existing sign-in behavior.</p>
 <p><strong>HIPAA compliance is an organizational responsibility, not a property guaranteed by this code.</strong>
 Do not load real protected health information (PHI) until the deployment safeguards below are in place.
 No code or hosting vendor can establish compliance merely by calling an API “secure.”</p>
@@ -32,17 +33,90 @@ Accept: application/json
 Content-Type: application/json</pre>
 <p>Sign in with <code>POST /auth/login</code>:</p>
 <pre>{"email":"guest@example.org","password":"&lt;user password&gt;"}</pre>
-<p>The response contains <code>access_token</code> and <code>expires_in</code>. For subsequent requests also send
+<p>The email field also accepts a self-registered account's username (case-insensitive). Existing operator accounts receive
+<code>access_token</code> and <code>expires_in</code>. MFA accounts instead receive only <code>{"mfa_token":"&lt;token&gt;"}</code>;
+send <code>{"mfa_token":"&lt;token&gt;","code":"123456"}</code> to <code>POST /auth/mfa/verify</code> to obtain the session.
+MFA challenges expire after five minutes, are single-use and bound to the API client and current password.
+For subsequent authenticated requests also send
 <code>Authorization: Bearer&#32;&lt;access_token&gt;</code>. The client credentials alone do not grant user permissions.
 Treat bearer tokens as secrets; never put any credentials in query strings, analytics, crash reports, or logs.</p>
 <p><code>GET /auth/me</code> returns the signed-in user, assigned groups, and effective permissions.
 Permissions are additive across memberships, with record scopes enforced on every operation.
 Signing out via <code>POST /auth/logout</code> revokes the current session. Handle HTTP 401 by signing in again; do not retry passwords automatically.</p>
+<h3>Guest self-registration</h3>
+<p>All stages still require the API client headers. No user session is created until email activation, profile completion,
+and authenticator verification have all succeeded. Public registration accepts no role, membership, owner or user ID fields;
+it creates only a Guest membership. Only trusted operators may grant staff access.</p>
+<ol>
+<li><code>POST /auth/register</code> with exactly:
+<pre>{"name":"Alex Example","date_of_birth":"1996-04-15","email":"alex@example.org",
+ "gender":"Prefer not to say","terms_accepted":true,"privacy_accepted":true}</pre>
+Name is nonempty text up to 120 characters; gender is nonempty text up to 60 characters, including a free-text or
+prefer-not-to-say answer. Date of birth is a real YYYY-MM-DD date between 1900-01-01 and today (UTC).
+Each acceptance must independently be the JSON boolean <code>true</code>; separate acceptance timestamps are retained.
+The response is always the same eligibility-neutral <code>{"message":"..."}</code> for valid new or duplicate addresses.
+Duplicate live registrations are not reset or resent. Expired incomplete registrations can be restarted.</li>
+<li>The configured PHP mail transport sends a 24-hour link to the fixed configured portal origin:
+<code>https://your-camp-host/public/?activate=&lt;token&gt;</code>.
+The portal submits <code>{"token":"&lt;token&gt;"}</code> to <code>POST /auth/activate</code>.
+The single-use activation token is exchanged for <code>{"onboarding_token":"&lt;token&gt;"}</code>.
+The onboarding capability expires after 24 hours and is bound to the API client used for activation;
+it never authorizes record/session endpoints. Keep it only in protected server-side portal session storage.</li>
+<li><code>POST /auth/profile</code>:
+<pre>{"onboarding_token":"&lt;token&gt;","username":"alex.example",
+ "password":"&lt;12-1024 byte password&gt;","password_confirmation":"&lt;same password&gt;"}</pre>
+Username is case-insensitive and 3–40 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit;
+email-style usernames are not allowed. Conflicting usernames return 409. Passwords are Argon2id-hashed and cannot contain null bytes.
+Optionally add <code>profile_picture</code> containing canonical raw base64 JPEG or PNG (no data-URL prefix), decoded size at most
+256 KiB, each dimension at most 4096 pixels, and at most 16 million pixels. Omit the property when absent.
+This endpoint alone permits a 768 KiB JSON body to accommodate base64 and slash escaping; other bodies remain limited to 64 KiB.
+The response is <code>{"mfa_secret":"&lt;base32&gt;","mfa_uri":"otpauth://totp/..."}</code>.
+Retain the unchanged onboarding token. Profile submission is one-time and cannot replace a username, password or authenticator after establishment.</li>
+<li>For reload/retry, send <code>{"onboarding_token":"&lt;token&gt;"}</code> to <code>POST /auth/mfa/setup</code>.
+Only the profile-complete, not-yet-confirmed stage can retrieve the same <code>mfa_secret</code> and <code>mfa_uri</code>.
+Display these privately for manual entry into a compatible authenticator. Do not send the secret to third-party QR services.</li>
+<li><code>POST /auth/mfa/confirm</code> with <code>{"onboarding_token":"&lt;token&gt;","code":"123456"}</code>
+validates the authenticator and atomically creates the Guest account and session:
+<code>{"access_token":"&lt;token&gt;","expires_in":3600}</code>. The onboarding token is then invalidated.
+Proceed to the dashboard using <code>GET /auth/me</code>. All later password logins require <code>/auth/mfa/verify</code>.</li>
+</ol>
+<p>TOTP uses a random 160-bit secret, HMAC-SHA1, six digits and 30-second periods, accepting at most one period of clock skew.
+Each accepted time step is recorded under a transaction lock; a code cannot be reused for another session, including the enrollment code.
+If signing in immediately after setup, wait for the authenticator's next code. There are no email-only sessions, recovery-code bypasses,
+public password resets, or public MFA disabling. Lost-factor recovery requires a separately reviewed operator identity-verification process.</p>
+<h3>Registration deployment and upgrades</h3>
+<p>Read <code>APP_PUBLIC_URL</code> and <code>APP_MAIL_FROM</code> from the process environment (takes precedence) or protected root
+<code>.env</code>. The URL must be absolute, with the exact path <code>/public/</code>, no user information, query or fragment,
+and HTTPS in production. The sender must be a valid email without header control characters. Neither activation links nor mail headers
+are derived from request Host/forwarded headers or submitted origins. Leave both unset to preserve legacy sign-in while registration returns 503.
+Configure PHP's native <code>mail()</code> transport using server-level <code>sendmail_path</code> or platform SMTP settings;
+there is no development-token response or production test-mail bypass. Monitor delivery, configure SPF/DKIM/DMARC and protect mail infrastructure.
+An accepted transport handoff does not guarantee mailbox delivery.</p>
+<p>The portal separately requires <code>PORTAL_TERMS_URL</code> and <code>PORTAL_PRIVACY_URL</code> to point to your published policies.
+Like its existing <code>PORTAL_API_*</code> credentials, these portal settings must be set in the portal process environment, not only in <code>.env</code>.
+Without both valid policy URLs, the portal hides the registration form rather than requesting acceptance of missing policies.</p>
+<p>Existing installations must rerun <code>php bin/console.php setup</code> with the migration identity before deploying new code.
+Schema changes are additive: <code>account_onboarding</code> and <code>mfa_challenges</code>; existing users and memberships are not migrated or changed.
+Grant the runtime account SELECT/INSERT/UPDATE/DELETE on both new tables and INSERT on users/memberships for final Guest creation,
+in addition to existing runtime grants. Keep role-management policy CLI-only and deny runtime UPDATE/DELETE on audit_events.
+Schedule <code>php bin/console.php cleanup</code> to remove expired incomplete registrations, challenges, and existing expired operational data.
+Completed encrypted profiles, consent dates, and MFA secrets are retained; establish an approved retention and recovery policy.</p>
+<p>Name, birth date, gender, photo and TOTP secrets are encrypted with the application key using authenticated sodium secretbox encryption.
+The public display name for new accounts is their username; email, username, consent timestamps and ownership/stage metadata are not encrypted.
+Activation/onboarding/challenge/session capabilities are stored only as SHA-256 hashes, expire, and are invalidated on successful consumption.
+Registration, activation, profile and MFA endpoints are throttled independently; failed MFA attempts are counted outside rollback-able transactions.
+Password changes, membership changes, session revocation, disabling users and revoking clients invalidate pending MFA login challenges.</p>
 </section>
 <section id="endpoints">
 <h2>Endpoint reference</h2>
 <dl>
-<dt><code>POST /auth/login</code></dt><dd>Client credentials plus email/password; creates an expiring user session.</dd>
+<dt><code>POST /auth/register</code></dt><dd>Validated initial profile and separate terms/privacy acceptance; generic response, activation by email.</dd>
+<dt><code>POST /auth/activate</code></dt><dd>Exchange a single-use activation token for an expiring onboarding token.</dd>
+<dt><code>POST /auth/profile</code></dt><dd>One-time username/password/photo establishment; returns private TOTP setup details.</dd>
+<dt><code>POST /auth/mfa/setup</code></dt><dd>Resume the same pending authenticator setup using the unchanged onboarding token.</dd>
+<dt><code>POST /auth/mfa/confirm</code></dt><dd>Confirm enrollment and atomically create a Guest session.</dd>
+<dt><code>POST /auth/login</code></dt><dd>Client credentials plus email-or-username/password; legacy session or expiring MFA challenge.</dd>
+<dt><code>POST /auth/mfa/verify</code></dt><dd>Single-use MFA challenge and fresh six-digit authenticator code; creates a session.</dd>
 <dt><code>GET /auth/me</code></dt><dd>Current user, database memberships, effective permissions.</dd>
 <dt><code>POST /auth/logout</code></dt><dd>Revokes the presented bearer token.</dd>
 <dt><code>GET /resources</code></dt><dd>Authorized resource schemas and permitted operations. Use this as the live field reference.</dd>
@@ -141,7 +215,9 @@ Grant applications are distinct from finance allocation/approval records. A gues
 <section id="examples">
 <h2>Client examples</h2>
 <p>Each example signs in and fetches groups through <code>/auth/me</code>. Replace the base URL with your own TLS endpoint.
-Credentials come from secure runtime configuration, not source code. Examples intentionally do not print passwords, tokens or PHI.
+Credentials come from secure runtime configuration, not source code. The password-only examples below target existing operator accounts;
+MFA clients must handle the challenge/verify branch documented above before using a bearer session.
+Examples intentionally do not print passwords, tokens or PHI.
 Handle production network errors, cancellation, reauthentication and HTTP 429 with bounded backoff.</p>
 <h3>JavaScript (trusted Node.js server, built-in fetch)</h3>
 <pre>const base = process.env.CAMP_API_BASE;
@@ -342,7 +418,8 @@ Rotation requires a planned decrypt/re-encrypt migration; do not simply replace 
 <li>Use a least-privilege runtime MySQL account, a separate migration identity, encrypted DB transport when remote,
 encrypted disks/backups, tested restore procedures, and restricted network access. Set <code>DB_SSL_CA</code> to the trusted
 CA certificate for remote production MySQL. Application encryption does not protect all metadata, including account identities and ownership links.</li>
-<li>Implement MFA and an approved identity lifecycle before production PHI access. Review privileged memberships,
+<li>Self-registration mandates TOTP, but existing operator accounts retain password-only compatibility.
+Implement privileged-operator MFA and an approved identity/recovery lifecycle before production PHI access. Review privileged memberships,
 disable departed users, revoke compromised clients/sessions and rotate secrets through controlled operations.</li>
 <li>Protect audit storage against runtime alteration using restricted grants and remote immutable retention.
 Monitor denied access, abnormal reads, login failures, exports, and privileged CLI changes.

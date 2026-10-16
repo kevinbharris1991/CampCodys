@@ -28,10 +28,12 @@ Passwords must be 12-1024 bytes. Never pass passwords on the command line.
 Client scopes are explicit resource names, or the deliberately privileged literal "all".
 Setup requires a pre-created MySQL database and DDL privileges. Runtime should use a
 separate account with SELECT/INSERT/UPDATE/DELETE only; deny UPDATE/DELETE on audit_events.
-Use a restricted local account for operations; no HTTP role or user provisioning exists.
+Use a restricted local account for operations; public registration grants Guest only.
+Runtime needs CRUD on account_onboarding and mfa_challenges as well as existing tables.
 Keep stdout credentials private, not in shell logs, browser source, or version control.
 All record payloads are encrypted. Back up the encryption key separately from the database.
-CLI cleanup removes only expired rate buckets and sessions expired/revoked over 30 days ago.
+CLI cleanup removes expired rate buckets, MFA challenges, incomplete registrations,
+and sessions expired/revoked over 30 days ago. Completed profiles and consent dates remain.
 seed-task preloads only sanitation, sensory_setup, safety_notices, emergency_plans,
 or emergency_alerts for teams with read/update access. It cannot provision camper data.
 
@@ -117,12 +119,16 @@ try {
             }
             $query('UPDATE users SET password_hash = ? WHERE id = ?', [passwordInput(), $id]);
             $query('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ?', [$id]);
+            $query('DELETE FROM mfa_challenges WHERE user_id = ?', [$id]);
             $audit('password.change', 'users', $id);
             $result = ['updated' => true];
             break;
         case 'membership':
             $user = positive($argv[2] ?? null);
             $role = positive($argv[3] ?? null);
+            if (!$query('SELECT id FROM users WHERE id = ? FOR UPDATE', [$user])->fetchColumn()) {
+                throw new \RuntimeException('User not found');
+            }
             if (($argv[4] ?? '') === 'remove') {
                 $query('DELETE FROM memberships WHERE user_id = ? AND role_id = ?', [$user, $role]);
                 if ($role === 7) {
@@ -134,6 +140,7 @@ try {
                 $query('INSERT IGNORE INTO memberships (user_id, role_id) VALUES (?, ?)', [$user, $role]);
             }
             $query('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ?', [$user]);
+            $query('DELETE FROM mfa_challenges WHERE user_id = ?', [$user]);
             $audit('membership.change', 'users', $user);
             $result = ['updated' => true];
             break;
@@ -197,21 +204,28 @@ try {
             $id = positive($argv[2] ?? null);
             $query('UPDATE api_clients SET active = 0 WHERE id = ?', [$id]);
             $query('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE client_id = ?', [$id]);
+            $query('DELETE FROM mfa_challenges WHERE client_id = ?', [$id]);
             $audit('client.revoke', 'api_clients', $id);
             $result = ['revoked' => true];
             break;
         case 'disable-user':
         case 'revoke-sessions':
             $id = positive($argv[2] ?? null);
+            if (!$query('SELECT id FROM users WHERE id = ? FOR UPDATE', [$id])->fetchColumn()) {
+                throw new \RuntimeException('User not found');
+            }
             if ($command === 'disable-user') {
                 $query('UPDATE users SET active = 0 WHERE id = ?', [$id]);
             }
             $query('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ?', [$id]);
+            $query('DELETE FROM mfa_challenges WHERE user_id = ?', [$id]);
             $audit($command, 'users', $id);
             $result = ['revoked' => true];
             break;
         case 'cleanup':
             $query('DELETE FROM rate_limits WHERE expires_at < UTC_TIMESTAMP()');
+            $query('DELETE FROM mfa_challenges WHERE expires_at <= UTC_TIMESTAMP()');
+            $query("DELETE FROM account_onboarding WHERE stage <> 'complete' AND expires_at <= UTC_TIMESTAMP()");
             $query('DELETE FROM sessions WHERE expires_at < UTC_TIMESTAMP() - INTERVAL 30 DAY OR revoked_at < UTC_TIMESTAMP() - INTERVAL 30 DAY');
             $audit('cleanup');
             $result = ['cleaned' => true];

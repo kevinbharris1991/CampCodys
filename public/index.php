@@ -78,12 +78,16 @@ function api(string $method, string $path, ?array $body = null): array
     }
     if ($status === 401) {
         unset($_SESSION['access_token']);
+        $failure = json_decode($response, true);
+        if (str_starts_with($path, '/auth/') && is_string($failure['error'] ?? null)) {
+            throw new RuntimeException($failure['error'], $status);
+        }
         throw new RuntimeException('Sign in again. Your session or API credentials were not accepted.');
     }
     if ($status >= 400) {
         $failure = json_decode($response, true);
         if (in_array($status, [409, 413, 422, 429], true) && is_string($failure['error'] ?? null)) {
-            throw new RuntimeException($failure['error']);
+            throw new RuntimeException($failure['error'], $status);
         }
         throw new RuntimeException('API request rejected (HTTP ' . $status . '). Check your permissions and the API documentation.');
     }
@@ -128,6 +132,10 @@ if (isset($_GET['activate']) && !isset($_SESSION['access_token'])) {
 }
 $notice = $_SESSION['notice'] ?? '';
 unset($_SESSION['notice']);
+if (!isset($_SESSION['access_token']) && isset($_SESSION['mfa_setup']) && $page === 'profile') {
+    header('Location: /public/?page=mfa');
+    exit;
+}
 $error = '';
 $result = null;
 $me = null;
@@ -192,7 +200,18 @@ try {
                 unset($_SESSION['activation_token']);
                 session_regenerate_id(true);
             }
-            $setup = api('POST', '/auth/profile', ['onboarding_token' => $_SESSION['onboarding_token']] + $body);
+            try {
+                $setup = api('POST', '/auth/profile', ['onboarding_token' => $_SESSION['onboarding_token']] + $body);
+            } catch (RuntimeException $exception) {
+                if ($exception->getCode() !== 409) {
+                    throw $exception;
+                }
+                try {
+                    $setup = api('POST', '/auth/mfa/setup', ['onboarding_token' => $_SESSION['onboarding_token']]);
+                } catch (RuntimeException) {
+                    throw $exception;
+                }
+            }
             $_SESSION['mfa_setup'] = $setup;
             header('Location: /public/?page=mfa');
             exit;
@@ -363,7 +382,7 @@ try {
         <h2>Configure multi-factor authentication</h2>
         <p>Add a time-based account in your authenticator app using this setup key. Keep it private.</p>
         <pre><?= escape($_SESSION['mfa_setup']['mfa_secret'] ?? '') ?></pre>
-        <p>Account: your Camp Cody's username. Use six-digit codes, a 30-second interval, and SHA-1.</p>
+        <p>Account: your registration email address. Use six-digit codes, a 30-second interval, and SHA-1.</p>
         <form method="post">
             <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
             <input type="hidden" name="action" value="confirm_mfa">

@@ -21,6 +21,7 @@ $count = 0;
 $clientToken = bin2hex(random_bytes(24));
 $clientSecret = bin2hex(random_bytes(32));
 $base = '';
+$mailCapture = $root . '/.local/mail-' . $name . '.txt';
 
 function expect(bool $condition, string $name): void
 {
@@ -96,7 +97,8 @@ function startServer(bool $portal = false): string
     }
     $command = $portal
         ? [PHP_BINARY, '-d', 'session.save_path=' . $portalSessionDir, '-S', '127.0.0.1:' . $port, '-t', $root]
-        : [PHP_BINARY, '-S', '127.0.0.1:' . $port, $root . '/tests/router.php'];
+        : [PHP_BINARY, '-d', 'sendmail_path=' . PHP_BINARY . ' ' . $root . '/tests/capture-mail.php',
+            '-S', '127.0.0.1:' . $port, $root . '/tests/router.php'];
     $process = proc_open($command, [
         0 => ['pipe', 'r'], 1 => ['file', $root . '/.local/integration-server.log', 'a'],
         2 => ['file', $root . '/.local/integration-server.log', 'a'],
@@ -117,6 +119,8 @@ function startServer(bool $portal = false): string
 function portalRequest(CurlHandle $curl, string $url, ?array $fields = null): array
 {
     curl_setopt($curl, CURLOPT_URL, $url);
+    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($curl, CURLOPT_MAXREDIRS, 5);
     if ($fields === null) {
         curl_setopt($curl, CURLOPT_HTTPGET, true);
     } else {
@@ -276,6 +280,8 @@ try {
     foreach ([
         'APP_ENV' => 'test', 'APP_REQUIRE_TLS' => 'false', 'DB_DSN' => $dsn . ';dbname=' . $name,
         'DB_USER' => $name, 'DB_PASSWORD' => $dbPassword, 'APP_ENCRYPTION_KEY' => base64_encode($key),
+        'APP_PUBLIC_URL' => 'https://registration.example.test/public/', 'APP_MAIL_FROM' => 'accounts@example.test',
+        'TEST_MAIL_CAPTURE' => $mailCapture,
     ] as $variable => $value) {
         putenv("$variable=$value");
     }
@@ -301,6 +307,11 @@ try {
             $db->prepare('INSERT INTO memberships (user_id, role_id) VALUES (?, ?)')->execute([$role, min($role, 12)]);
         }
     }
+    [$code] = cli(['setup']);
+    expect($code === 0 && (int) $db->query('SELECT COUNT(*) FROM users')->fetchColumn() === 15,
+        'additive setup preserves populated existing users');
+    expect($db->query('SELECT password_hash FROM users WHERE id = 1')->fetchColumn() === $passwordHash,
+        'setup preserves existing operator credentials');
     [$code, $output] = cli(['client', 'Integration', 'all']);
     expect($code === 0, 'CLI client provisioning');
     $credentials = json_decode($output, true, 32, JSON_THROW_ON_ERROR);
@@ -322,6 +333,11 @@ try {
     [$code] = cli(['membership', '14', '8']);
     expect($code === 0, 'CLI role membership');
     $base = startServer();
+    require __DIR__ . '/onboarding-cases.php';
+    if (getenv('TEST_ONBOARDING_ONLY') === '1') {
+        echo "PASS: $count onboarding integration assertions\n";
+        return;
+    }
     expect(request('POST', '/auth/login', null, ['email' => 'role1@example.test', 'password' => $password], false)[0] === 401, 'login requires client credentials');
     expect(request('GET', '/resources', null, null, false)[0] === 401, 'resources require client credentials');
     expect(request('GET', '/resources')[0] === 401, 'resources require session');
@@ -679,6 +695,8 @@ try {
     putenv('PORTAL_API_BASE_URL=' . $base . '/api/v1');
     putenv('PORTAL_API_TOKEN=' . $clientToken);
     putenv('PORTAL_API_SECRET=' . $clientSecret);
+    putenv('PORTAL_TERMS_URL=https://policies.example.test/terms');
+    putenv('PORTAL_PRIVACY_URL=https://policies.example.test/privacy');
     $portalUrl = startServer(true) . '/public/index.php';
     putenv('APP_ENV=test');
     $browser = curl_init();
@@ -801,6 +819,7 @@ try {
         expect($status === 200 && str_contains($html, 'Staff &amp; guest sign in'), 'shared portal user can sign out ' . $role);
     }
     expect(count(array_unique($sharedPortalUsers)) > 10, 'more than ten distinct valid portal users authenticate without resetting rate counters');
+    require __DIR__ . '/portal-onboarding-cases.php';
     curl_close($browser);
     $portalAssertions = $count - $portalAssertionsStart;
     api('POST', '/auth/logout', $guest);
@@ -849,6 +868,9 @@ try {
     expect($code === 0, 'CLI cleanup');
     echo "PASS: $count MySQL/HTTP/portal integration assertions ($portalAssertions portal assertions)\n";
 } finally {
+    if (is_file($mailCapture)) {
+        unlink($mailCapture);
+    }
     foreach ($servers as $server) {
         proc_terminate($server);
         proc_close($server);
