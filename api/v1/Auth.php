@@ -80,7 +80,6 @@ trait RegistrationAuth
 
     private function register(): array
     {
-        $this->rate('register:' . $this->addressHash, 10, 3600);
         $body = $this->body();
         $this->authFields($body, ['name', 'date_of_birth', 'email', 'gender', 'terms_accepted', 'privacy_accepted']);
         if (!$this->authText($body['name'], 120)) {
@@ -92,8 +91,8 @@ trait RegistrationAuth
             || $date->format('Y-m-d') !== $dob || $dob > gmdate('Y-m-d') || $dob < '1900-01-01') {
             throw new ApiError(422, 'Date of birth must be a real date between 1900-01-01 and today (YYYY-MM-DD)');
         }
-        if ($date->diff(new \DateTimeImmutable('today', new \DateTimeZone('UTC')))->y < 18) {
-            throw new ApiError(422, 'You must be 18 or older to register');
+        if ($date->diff(new \DateTimeImmutable('today', new \DateTimeZone('UTC')))->y < 13) {
+            throw new ApiError(422, 'You must be 13 or older to register');
         }
         if (!is_string($body['email']) || strlen($body['email']) > 254 || !filter_var(trim($body['email']), FILTER_VALIDATE_EMAIL)) {
             throw new ApiError(422, 'A valid email address is required');

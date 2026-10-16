@@ -120,7 +120,7 @@ function signedIn(array $login): void
 $termsUrl = policyUrl('PORTAL_TERMS_URL');
 $privacyUrl = policyUrl('PORTAL_PRIVACY_URL');
 $today = new DateTimeImmutable('today', new DateTimeZone('UTC'));
-$birthDateLimit = $today->modify('-18 years');
+$birthDateLimit = $today->modify('-13 years');
 if ($birthDateLimit->format('m-d') !== $today->format('m-d')) {
     $birthDateLimit = $birthDateLimit->modify('-1 day');
 }
@@ -345,7 +345,7 @@ try {
     <?php if (!isset($_SESSION['access_token']) && $page === 'register'): ?>
     <section>
         <h2>Create your account</h2>
-        <p>You must be 18 or older to register. First, tell us about yourself. We will email an activation link so you can choose your username and password and secure your account.</p>
+        <p>You must be 13 or older to register. First, tell us about yourself. We will email an activation link so you can choose your username and password and secure your account.</p>
         <?php if ($termsUrl === '' || $privacyUrl === ''): ?>
         <p role="alert">Registration is temporarily unavailable. Contact camp staff.</p>
         <?php else: ?>

@@ -8,17 +8,17 @@ function authCall(string $path, array|string $body, int $status = 200, array $he
     return $result;
 }
 
-function signupFixture(string $email): array
+function signupFixture(string $email, ?string $dateOfBirth = null): array
 {
     global $db, $mailCapture;
     $db->exec('DELETE FROM rate_limits');
     $before = is_file($mailCapture) ? strlen(file_get_contents($mailCapture)) : 0;
-    $fields = ['name' => 'Registration Test', 'date_of_birth' => '1996-04-15', 'email' => $email,
+    $fields = ['name' => 'Registration Test', 'date_of_birth' => $dateOfBirth ?? '1996-04-15', 'email' => $email,
         'gender' => 'prefer_not_to_say', 'terms_accepted' => true, 'privacy_accepted' => true];
     $response = authCall('register', $fields, 200, ['Host: untrusted.example.test', 'X-Forwarded-Host: evil.example.test']);
     $mail = substr(file_get_contents($mailCapture), $before);
     expect((bool) preg_match('~https://registration\.example\.test/public/\?activate=([a-f0-9]{64})~', $mail, $match), 'activation uses fixed trusted origin');
-    expect(!str_contains($mail, 'evil.example.test') && !str_contains($mail, '1996-04-15'), 'activation mail excludes injected origins and profile data');
+    expect(!str_contains($mail, 'evil.example.test') && !str_contains($mail, $fields['date_of_birth']), 'activation mail excludes injected origins and profile data');
     expect(array_keys($response) === ['message'], 'registration exposes no tokens or account details');
     return [$fields, $match[1], $response];
 }
@@ -61,6 +61,37 @@ $onboardingStart = $count;
 try {
     $registration = ['name' => 'Registration Test', 'date_of_birth' => '1996-04-15', 'email' => 'new-guest@example.test',
         'gender' => 'prefer_not_to_say', 'terms_accepted' => true, 'privacy_accepted' => true];
+    $today = new DateTimeImmutable('today', new DateTimeZone('UTC'));
+    $thirteenthBirthday = $today->modify('-13 years');
+    if ($thirteenthBirthday->format('m-d') !== $today->format('m-d')) {
+        $thirteenthBirthday = $thirteenthBirthday->modify('-1 day');
+    }
+    signupFixture('age-exactly-13@example.test', $thirteenthBirthday->format('Y-m-d'));
+    expect((int) $db->query("SELECT COUNT(*) FROM account_onboarding WHERE email = 'age-exactly-13@example.test'")->fetchColumn() === 1,
+        'registration accepts the thirteenth birthday inclusively');
+    $underageResponse = authCall('register', array_replace($registration, [
+        'email' => 'age-one-day-too-young@example.test', 'date_of_birth' => $thirteenthBirthday->modify('+1 day')->format('Y-m-d'),
+    ]), 422);
+    expect(str_contains($underageResponse['error'] ?? '', '13'), 'underage validation explains the current minimum age without exposing submitted data');
+    authCall('register', array_replace($registration, [
+        'email' => 'age-12@example.test', 'date_of_birth' => $today->modify('-12 years')->format('Y-m-d'),
+    ]), 422);
+    expect((int) $db->query("SELECT COUNT(*) FROM account_onboarding WHERE email IN ('age-one-day-too-young@example.test', 'age-12@example.test')")->fetchColumn() === 0,
+        'underage rejection does not create pending registration');
+    signupFixture('age-over-13@example.test', $thirteenthBirthday->modify('-1 day')->format('Y-m-d'));
+    $olderLeapYear = (int) $today->format('Y') - 17;
+    while (!checkdate(2, 29, $olderLeapYear)) {
+        $olderLeapYear--;
+    }
+    signupFixture('age-older-leap-birthday@example.test', sprintf('%04d-02-29', $olderLeapYear));
+    $recentLeapYear = (int) $today->format('Y');
+    while (!checkdate(2, 29, $recentLeapYear) || sprintf('%04d-02-29', $recentLeapYear) > $today->format('Y-m-d')) {
+        $recentLeapYear--;
+    }
+    authCall('register', array_replace($registration, [
+        'email' => 'age-young-leap-birthday@example.test', 'date_of_birth' => sprintf('%04d-02-29', $recentLeapYear),
+    ]), 422);
+    $db->exec('DELETE FROM rate_limits');
     foreach ([
         ['terms_accepted' => false], ['privacy_accepted' => false], ['terms_accepted' => 'true'],
         ['date_of_birth' => '2025-02-30'], ['date_of_birth' => '2099-01-01'], ['email' => "no\r\nBcc:bad@example.test"],
@@ -258,7 +289,12 @@ try {
     for ($i = 0; $i < 10; $i++) {
         authCall('register', [], 422);
     }
-    authCall('register', [], 429);
+    authCall('register', [], 422);
+    for ($i = 0; $i < 3; $i++) {
+        authCall('register', array_replace($registration, ['email' => 'email-throttle@example.test']));
+    }
+    authCall('register', array_replace($registration, ['email' => 'email-throttle@example.test']), 429);
+    authCall('register', array_replace($registration, ['email' => 'separate-visitor@example.test']));
     $events = json_encode($db->query('SELECT * FROM audit_events')->fetchAll());
     expect(!str_contains($events, $activation) && !str_contains($events, $onboarding) && !str_contains($events, $details['mfa_secret']), 'audit never records authentication capabilities or MFA secrets');
     echo 'PASS: ' . ($count - $onboardingStart) . " new onboarding assertions\n";

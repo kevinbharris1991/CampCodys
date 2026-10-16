@@ -53,7 +53,7 @@ it creates only a Guest membership. Only trusted operators may grant staff acces
  "gender":"prefer_not_to_say","terms_accepted":true,"privacy_accepted":true}</pre>
 Name is nonempty text up to 120 characters; gender must be one of <code>female</code>, <code>male</code>,
 <code>non_binary</code>, <code>self_described</code> or <code>prefer_not_to_say</code>.
-Date of birth is a real YYYY-MM-DD date on or after 1900-01-01. Registrants must be 18 or older, including on their eighteenth birthday (UTC); the API rejects younger users even if browser validation is bypassed.
+Date of birth is a real YYYY-MM-DD date on or after 1900-01-01. Registrants must be 13 or older, including on their thirteenth birthday (UTC); the API rejects younger users even if browser validation is bypassed.
 Each acceptance must independently be the JSON boolean <code>true</code>; separate acceptance timestamps are retained.
 The response is always the same eligibility-neutral <code>{"message":"..."}</code> for valid new or duplicate addresses.
 For an incomplete account, re-registration sends a fresh activation/recovery link without changing stored demographics,

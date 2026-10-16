@@ -9,6 +9,13 @@ expect(str_contains($html, 'name="terms_accepted"') && str_contains($html, 'name
     'portal provides separately linked policy acceptances');
 expect(!str_contains($html, 'name="password"') && !str_contains($html, 'name="username"')
     && !str_contains($html, 'name="profile_picture"'), 'initial registration does not ask for later-stage fields');
+$portalToday = new DateTimeImmutable('today', new DateTimeZone('UTC'));
+$portalAgeCutoff = $portalToday->modify('-13 years');
+if ($portalAgeCutoff->format('m-d') !== $portalToday->format('m-d')) {
+    $portalAgeCutoff = $portalAgeCutoff->modify('-1 day');
+}
+expect((bool) preg_match('~name="date_of_birth"[^>]*max="' . preg_quote($portalAgeCutoff->format('Y-m-d'), '~') . '"~', $html),
+    'portal birth-date picker prevents dates younger than thirteen');
 $portalRegistration = ['csrf' => portalCsrf($html), 'action' => 'register', 'name' => 'Private Portal Name',
     'date_of_birth' => '1998-05-04', 'email' => 'portal-new-guest@example.test', 'gender' => 'prefer_not_to_say',
     'terms_accepted' => '1', 'privacy_accepted' => '1'];
