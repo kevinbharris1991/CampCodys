@@ -52,7 +52,7 @@ Set `PORTAL_TERMS_URL` and `PORTAL_PRIVACY_URL` in the portal process environmen
 to your published HTTPS terms of service and privacy policy. Registration stays
 unavailable until these policies are configured.
 
-New guests register their name, date of birth, email and gender, accepting both
+New guests must be 18 or older and register their name, date of birth, email and gender, accepting both
 policies before submitting. The activation email opens profile setup, with an
 optional JPEG/PNG picture (256 KiB maximum), a unique username and a confirmed
 password (12–1024 bytes). A verified authenticator-app code is required to finish

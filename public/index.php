@@ -119,6 +119,11 @@ function signedIn(array $login): void
 
 $termsUrl = policyUrl('PORTAL_TERMS_URL');
 $privacyUrl = policyUrl('PORTAL_PRIVACY_URL');
+$today = new DateTimeImmutable('today', new DateTimeZone('UTC'));
+$birthDateLimit = $today->modify('-18 years');
+if ($birthDateLimit->format('m-d') !== $today->format('m-d')) {
+    $birthDateLimit = $birthDateLimit->modify('-1 day');
+}
 $page = is_string($_GET['page'] ?? null) ? $_GET['page'] : '';
 if (isset($_GET['activate']) && !isset($_SESSION['access_token'])) {
     if (!is_string($_GET['activate']) || !preg_match('/\A[a-f0-9]{64}\z/D', $_GET['activate'])) {
@@ -199,6 +204,11 @@ try {
                 $_SESSION['onboarding_token'] = $activation['onboarding_token'];
                 unset($_SESSION['activation_token']);
                 session_regenerate_id(true);
+                if (($activation['next_step'] ?? '') === 'mfa') {
+                    $_SESSION['mfa_setup'] = api('POST', '/auth/mfa/setup', ['onboarding_token' => $_SESSION['onboarding_token']]);
+                    header('Location: /public/?page=mfa');
+                    exit;
+                }
             }
             try {
                 $setup = api('POST', '/auth/profile', ['onboarding_token' => $_SESSION['onboarding_token']] + $body);
@@ -335,7 +345,7 @@ try {
     <?php if (!isset($_SESSION['access_token']) && $page === 'register'): ?>
     <section>
         <h2>Create your account</h2>
-        <p>First, tell us about yourself. We will email an activation link so you can choose your username and password and secure your account.</p>
+        <p>You must be 18 or older to register. First, tell us about yourself. We will email an activation link so you can choose your username and password and secure your account.</p>
         <?php if ($termsUrl === '' || $privacyUrl === ''): ?>
         <p role="alert">Registration is temporarily unavailable. Contact camp staff.</p>
         <?php else: ?>
@@ -343,7 +353,7 @@ try {
             <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
             <input type="hidden" name="action" value="register">
             <label>Name <input name="name" required autocomplete="name" maxlength="120"></label>
-            <label>Date of birth <input name="date_of_birth" type="date" required autocomplete="bday" max="<?= escape(gmdate('Y-m-d')) ?>"></label>
+            <label>Date of birth <input name="date_of_birth" type="date" required autocomplete="bday" min="1900-01-01" max="<?= escape($birthDateLimit->format('Y-m-d')) ?>"></label>
             <label>Email address <input name="email" type="email" required autocomplete="email" maxlength="254"></label>
             <label>Gender <select name="gender" required>
                 <option value="">Choose an option</option>

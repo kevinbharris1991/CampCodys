@@ -17,6 +17,7 @@ $name = 'camp_test_' . bin2hex(random_bytes(6));
 $dbPassword = bin2hex(random_bytes(24));
 $key = random_bytes(32);
 $servers = [];
+$portalSessionDirs = [];
 $count = 0;
 $clientToken = bin2hex(random_bytes(24));
 $clientSecret = bin2hex(random_bytes(32));
@@ -86,7 +87,7 @@ function cli(array $args, string $input = ''): array
 }
 function startServer(bool $portal = false): string
 {
-    global $root, $servers, $portalSessionDir;
+    global $root, $servers, $portalSessionDir, $portalSessionDirs;
     $socket = stream_socket_server('tcp://127.0.0.1:0', $error, $message);
     $address = stream_socket_get_name($socket, false);
     fclose($socket);
@@ -94,6 +95,7 @@ function startServer(bool $portal = false): string
     if ($portal) {
         $portalSessionDir = $root . '/.local/portal-sessions-' . bin2hex(random_bytes(6));
         mkdir($portalSessionDir, 0700);
+        $portalSessionDirs[] = $portalSessionDir;
     }
     $command = $portal
         ? [PHP_BINARY, '-d', 'session.save_path=' . $portalSessionDir, '-S', '127.0.0.1:' . $port, '-t', $root]
@@ -875,7 +877,7 @@ try {
         proc_terminate($server);
         proc_close($server);
     }
-    if (isset($portalSessionDir) && is_dir($portalSessionDir)) {
+    foreach ($portalSessionDirs as $portalSessionDir) {
         foreach (glob($portalSessionDir . '/sess_*') as $sessionFile) {
             unlink($sessionFile);
         }
