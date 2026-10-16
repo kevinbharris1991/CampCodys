@@ -104,6 +104,16 @@ function decryptPayload(string $encrypted, string $key): array
     return json_decode($plain, true, 32, JSON_THROW_ON_ERROR);
 }
 
+function projectPayload(string $encrypted, array $definition, string $key): array
+{
+    $payload = array_intersect_key(decryptPayload($encrypted, $key), $definition['fields']);
+    try {
+        return validateFields($payload, $definition);
+    } catch (ApiError) {
+        throw new \RuntimeException('Invalid stored record');
+    }
+}
+
 function validateFields(array $body, array $definition, bool $partial = false): array
 {
     foreach ($body as $name => $value) {

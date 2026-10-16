@@ -57,6 +57,21 @@ try {
 }
 check($rejected, 'tampering rejected');
 $catalog = \Camp\catalog();
+check(\Camp\projectPayload(\Camp\encryptPayload(['display_name' => 'Camper', 'clinical_note' => 'Never expose'], $key), $catalog['camper_names'], $key) === ['display_name' => 'Camper'], 'directory projects only a validated display name');
+$rejected = false;
+try {
+    \Camp\projectPayload(\Camp\encryptPayload(['display_name' => ['clinical_note' => 'Never expose']], $key), $catalog['camper_names'], $key);
+} catch (RuntimeException) {
+    $rejected = true;
+}
+check($rejected, 'nested arbitrary JSON in a named field fails closed');
+$publicGrant = \Camp\projectPayload(\Camp\encryptPayload([
+    'name' => 'Access scholarship', 'amount_cents' => 123456, 'fiscal_year' => '2027',
+    'application_status' => 'available', 'application_instructions' => 'Submit your application.',
+], $key), $catalog['grant_opportunities'], $key);
+check($publicGrant === ['name' => 'Access scholarship', 'application_instructions' => 'Submit your application.'], 'grant catalog projection excludes all finance and publication-control fields');
+check(!isset(\Camp\roleGrants()[12]['grants']), 'guest cannot access grant funding ledger');
+check($catalog['grant_applications']['fields']['grant_id']['target'] === 'grant_opportunities', 'guest applications reference safe grant catalog');
 check(count(\Camp\roleGrants()) === 12, 'all roles mapped');
 foreach (\Camp\roleGrants() as $resources) {
     foreach ($resources as $resource => $actions) {
@@ -76,6 +91,8 @@ foreach ([8, 9, 10, 11] as $role) {
 check(!isset(\Camp\roleGrants()[7]['incidents']['read']), 'counselor incident create-only');
 check(!isset(\Camp\roleGrants()[7]['activities']), 'counselor has no global schedule access');
 check(\Camp\roleGrants()[7]['daily_logs']['read'] === ['assigned'], 'counselor assignment scope');
+check(\Camp\roleGrants()[7]['consultation_notes']['read'] === ['assigned'], 'counselor strategies are assignment-scoped');
+check(!isset(\Camp\roleGrants()[7]['behavioral_plans']) && !isset(\Camp\roleGrants()[7]['behavioral_tracking']), 'counselors cannot read full behavioral plans or tracking');
 check(\Camp\roleGrants()[12]['prescriptions']['read'] === ['own'], 'guest prescription ownership');
 $expected = [
     [1, 'public_content', ['read', 'create', 'update', 'delete']],
@@ -83,17 +100,23 @@ $expected = [
     [1, 'financial_approvals', ['read', 'create', 'update']],
     [1, 'audit_events', ['read']],
     [1, 'configuration', ['read']],
-    [2, 'waivers', ['read', 'create', 'update', 'delete']],
-    [2, 'consents', ['read', 'create', 'update', 'delete']],
-    [2, 'demographics', ['read', 'create', 'update', 'delete']],
-    [2, 'rosters', ['read', 'create', 'update', 'delete']],
-    [2, 'policies', ['read', 'create', 'update', 'delete']],
+    [1, 'grant_opportunities', ['read']],
+    [2, 'campers', ['read', 'create', 'update']],
+    [2, 'reservations', ['read', 'create', 'update']],
+    [2, 'waivers', ['read', 'create', 'update']],
+    [2, 'consents', ['read', 'create', 'update']],
+    [2, 'demographics', ['read', 'create', 'update']],
+    [2, 'rosters', ['read', 'create', 'update']],
+    [2, 'policies', ['read', 'create', 'update']],
+    [2, 'staff_onboarding', ['read', 'create', 'update']],
+    [2, 'compliance_reports', ['read', 'create', 'update']],
     [2, 'templates', ['read', 'create', 'update', 'delete']],
-    [3, 'medication_schedules', ['read', 'create', 'update']],
+    [3, 'medication_schedules', ['read', 'create', 'update', 'delete']],
     [3, 'medication_administrations', ['read', 'create', 'update']],
     [3, 'medication_stock', ['read', 'create', 'update']],
     [3, 'clinical_incidents', ['read', 'create', 'update']],
     [4, 'behavioral_tracking', ['read', 'create', 'update']],
+    [4, 'behavioral_plans', ['read', 'create', 'update', 'delete']],
     [4, 'consultation_notes', ['read', 'create', 'update']],
     [4, 'behavior_health_context', ['read']],
     [5, 'accommodations', ['read', 'update']],
@@ -101,7 +124,9 @@ $expected = [
     [5, 'facility_audits', ['read', 'create', 'update']],
     [5, 'work_orders', ['read', 'create']],
     [6, 'participation', ['read', 'update']],
+    [6, 'activity_adaptations', ['read', 'create', 'update']],
     [6, 'camper_safety_alerts', ['read']],
+    [7, 'consultation_notes', ['read']],
     [8, 'work_orders', ['read', 'update']],
     [8, 'inspections', ['read', 'create', 'update']],
     [8, 'emergency_alerts', ['read', 'update']],
@@ -110,6 +135,11 @@ $expected = [
     [9, 'supply_requests', ['read', 'create']],
     [10, 'menus', ['read', 'create', 'update']],
     [10, 'special_meals', ['read', 'update']],
+    [10, 'camper_names', ['read']],
+    [12, 'dietary_profiles', ['read']],
+    [12, 'billing', ['read']],
+    [12, 'grant_opportunities', ['read']],
+    [11, 'grant_opportunities', ['read']],
 ];
 foreach ($expected as [$role, $resource, $actions]) {
     check(array_keys(\Camp\roleGrants()[$role][$resource]) === $actions, "exact role $role $resource actions");

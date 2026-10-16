@@ -139,11 +139,10 @@ final class App
 
     private function login(): array
     {
-        $this->rate('login:' . $this->addressHash, 10, 900);
         $body = $this->body();
         if (count($body) !== 2 || !isset($body['email'], $body['password'])
             || !is_string($body['email']) || !is_string($body['password'])
-            || strlen($body['email']) > 254 || strlen($body['password']) > 1024) {
+            || strlen($body['email']) > 254 || strlen($body['password']) > 1024 || str_contains($body['password'], "\0")) {
             throw new ApiError(422, 'Email and password required');
         }
         $email = strtolower(trim($body['email']));
@@ -151,13 +150,18 @@ final class App
         $user = $this->execute('SELECT * FROM users WHERE email = ? AND active = 1', [$email])->fetch();
         // A dummy Argon2id hash avoids skipping expensive verification for unknown accounts.
         $hash = $user['password_hash'] ?? '$argon2id$v=19$m=65536,t=4,p=1$WHpILnZCR0ppN1VoNGx4Lw$7FwzUCFZ5W/iqRyTrDay4jVmEcP/JCqrKdUBL0Gqh3g';
-        if (!password_verify($body['password'], $hash) || !$user) {
-            throw new ApiError(401, 'Invalid email or password');
+        $ambiguousLegacyPassword = password_get_info($hash)['algoName'] === 'bcrypt' && strlen($body['password']) > 72;
+        if ($ambiguousLegacyPassword || !password_verify($body['password'], $hash) || !$user) {
+            $this->rejectLogin();
         }
-        $this->user = $user;
-        $token = bin2hex(random_bytes(32));
         $this->db->beginTransaction();
-        $this->execute('SELECT id FROM users WHERE id = ? FOR UPDATE', [$user['id']]);
+        $locked = $this->execute('SELECT * FROM users WHERE id = ? FOR UPDATE', [$user['id']])->fetch();
+        if (!$locked || (int) $locked['active'] !== 1 || $locked['email'] !== $email
+            || !hash_equals($hash, $locked['password_hash'])) {
+            $this->rejectLogin();
+        }
+        $user = $this->user = $locked;
+        $token = bin2hex(random_bytes(32));
         $this->execute('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND expires_at <= UTC_TIMESTAMP() AND revoked_at IS NULL', [$user['id']]);
         $active = $this->execute('SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ORDER BY id DESC', [$user['id']])->fetchAll();
         foreach (array_slice($active, 9) as $session) {
@@ -172,6 +176,17 @@ final class App
         $this->audit('auth.login');
         $this->db->commit();
         return ['access_token' => $token, 'expires_in' => 3600];
+    }
+
+    private function rejectLogin(): never
+    {
+        if ($this->db->inTransaction()) {
+            $this->db->rollBack();
+        }
+        // A shared portal egress must not spend a network budget on successful sign-ins.
+        // Account/general limits bound verification work; only failures consume this broader budget.
+        $this->rate('login-failures:' . $this->addressHash, 100, 900);
+        throw new ApiError(401, 'Invalid email or password');
     }
 
     private function sessionHash(): string
@@ -237,7 +252,7 @@ final class App
         return match ($row['resource']) {
             'menus' => $row['visibility'] === 'published',
             'activities' => $row['visibility'] === 'available',
-            'grants' => true,
+            'grant_opportunities' => $row['visibility'] === 'available',
             default => false,
         };
     }
@@ -245,7 +260,13 @@ final class App
     private function find(string $resource, int $id, string $action = 'read', bool $lock = false): array
     {
         $this->scopes($resource, $action);
-        $row = $this->execute('SELECT * FROM records WHERE resource = ? AND id = ?' . ($lock ? ' FOR UPDATE' : ''), [$resource, $id])->fetch();
+        $opportunity = $resource === 'grant_opportunities';
+        $row = $this->execute('SELECT * FROM records WHERE resource = ? AND id = ?'
+            . ($opportunity ? " AND visibility = 'available'" : '') . ($lock ? ' FOR UPDATE' : ''),
+            [$opportunity ? 'grants' : $resource, $id])->fetch();
+        if ($row && $opportunity) {
+            $row['resource'] = 'grant_opportunities';
+        }
         if (!$row || !$this->accessible($row, $action)) {
             throw new ApiError(404, 'Record not found');
         }
@@ -254,9 +275,8 @@ final class App
 
     private function projection(array $row): array
     {
-        $payload = decryptPayload($row['payload'], $this->config['key']);
         // Never return fields not explicitly defined, even if old/imported payloads contain them.
-        $payload = array_intersect_key($payload, catalog()[$row['resource']]['fields']);
+        $payload = projectPayload($row['payload'], catalog()[$row['resource']], $this->config['key']);
         return [
             'id' => (int) $row['id'],
             'owner_id' => $row['owner_id'] === null ? null : (int) $row['owner_id'],
@@ -286,7 +306,7 @@ final class App
             $conditions[] = match ($resource) {
                 'menus' => "visibility = 'published'",
                 'activities' => "visibility = 'available'",
-                'grants' => '1 = 1',
+                'grant_opportunities' => "visibility = 'available'",
                 default => '1 = 0',
             };
         }
@@ -324,7 +344,7 @@ final class App
             default => throw new ApiError(405, 'Method not allowed'),
         };
         $this->scopes($resource, $action);
-        if (in_array($resource, ['audit_events', 'configuration'], true)) {
+        if (in_array($resource, ['audit_events', 'configuration', 'camper_names', 'grant_opportunities'], true)) {
             return $this->systemRecords($resource, $id);
         }
         if (($method === 'POST' && $id !== null) || (in_array($method, ['PUT', 'PATCH', 'DELETE'], true) && $id === null)) {
@@ -368,6 +388,9 @@ final class App
         if ($resource === 'activity_signups') {
             $payload['status'] ??= 'enrolled';
         }
+        if ($resource === 'grants') {
+            $payload['application_status'] ??= 'internal';
+        }
         $payload = validateFields($payload, $definition);
         if ($resource === 'participation' && $old) {
             $previous = decryptPayload($old['payload'], $this->config['key']);
@@ -385,8 +408,12 @@ final class App
             throw new ApiError(403, 'An applicant cannot approve or decline their own application');
         }
         $this->guestStatus($resource, $old, $payload);
-        $links = $this->validateLinks($resource, $definition, $payload, $ownerId, $camperId);
-        $visibility = in_array($resource, ['menus', 'activities'], true) ? $payload['status'] : '';
+        $links = $this->validateLinks($resource, $definition, $payload, $ownerId, $camperId, $old);
+        $visibility = match ($resource) {
+            'menus', 'activities' => $payload['status'],
+            'grants' => $payload['application_status'] ?? 'internal',
+            default => '',
+        };
         if ($resource === 'activities' && $old) {
             $count = count($this->execute('SELECT record_id FROM activity_enrollments WHERE activity_id = ? FOR UPDATE', [$id])->fetchAll());
             if ($payload['capacity'] < $count) {
@@ -503,12 +530,16 @@ final class App
         }
     }
 
-    private function validateLinks(string $resource, array $definition, array $payload, ?int $ownerId, ?int $camperId): array
+    private function validateLinks(string $resource, array $definition, array $payload, ?int $ownerId, ?int $camperId, ?array $old): array
     {
         $links = [];
         foreach ($definition['fields'] as $field => $metadata) {
             if ($metadata['type'] === 'reference' && isset($payload[$field])) {
-                $row = $this->find($metadata['target'], $payload[$field], 'read', true);
+                $reviewExistingGrant = $resource === 'grant_applications' && $field === 'grant_id' && $old
+                    && $payload[$field] === decryptPayload($old['payload'], $this->config['key'])['grant_id']
+                    && in_array('all', $this->grants['grants']['read'] ?? [], true);
+                // Financial reviewers may finish existing applications after a catalog entry closes.
+                $row = $this->find($reviewExistingGrant ? 'grants' : $metadata['target'], $payload[$field], 'read', true);
                 if (catalog()[$metadata['target']]['scope'] === 'camper'
                     && ((int) $row['camper_id'] !== $camperId || (int) $row['owner_id'] !== $ownerId)) {
                     throw new ApiError(422, 'Linked record must belong to the same camper and owner');
@@ -550,6 +581,23 @@ final class App
             if (!in_array($name, ['after', 'limit'], true) || !is_string($value) || !preg_match('/^[1-9][0-9]{0,17}$/D', $value)) {
                 throw new ApiError(422, 'Invalid query');
             }
+        }
+        if (in_array($resource, ['camper_names', 'grant_opportunities'], true)) {
+            $limit = min((int) ($_GET['limit'] ?? 50), 100);
+            $source = $resource === 'camper_names' ? 'campers' : 'grants';
+            $rows = $this->execute('SELECT id, payload FROM records WHERE resource = ?'
+                . ($resource === 'grant_opportunities' ? " AND visibility = 'available'" : '') . ' AND id '
+                . ($id === null ? '> ?' : '= ?') . ' ORDER BY id LIMIT ' . ($limit + 1),
+                [$source, $id ?? (int) ($_GET['after'] ?? 0)])->fetchAll();
+            if ($id !== null && !$rows) {
+                throw new ApiError(404, 'Record not found');
+            }
+            $more = count($rows) > $limit;
+            $rows = array_slice($rows, 0, $limit);
+            $records = array_map(fn(array $row): array => ['id' => (int) $row['id']]
+                + projectPayload($row['payload'], catalog()[$resource], $this->config['key']), $rows);
+            $this->audit($resource . '.read', $resource, $id);
+            return $id === null ? ['data' => $records, 'next_after' => $more ? (int) end($records)['id'] : null] : ['data' => $records[0]];
         }
         if ($resource === 'configuration') {
             if ($id !== null && $id !== 1) {
@@ -607,15 +655,41 @@ final class App
             if (!is_string($camperId) || !preg_match('/^[1-9][0-9]{0,17}$/D', $camperId)) {
                 throw new ApiError(422, 'Invalid camper_id');
             }
-            $this->find('campers', (int) $camperId);
+            if (isset($this->grants['camper_names']['read'])) {
+                if (!in_array('all', $this->scopes('camper_names', 'read'), true)) {
+                    throw new ApiError(403, 'Permission denied');
+                }
+                if (!$this->execute("SELECT id FROM records WHERE resource = 'campers' AND id = ?", [(int) $camperId])->fetchColumn()) {
+                    throw new ApiError(404, 'Camper not found');
+                }
+                $this->audit('camper_names.resolve', 'camper_names', (int) $camperId);
+            } else {
+                $this->find('campers', (int) $camperId);
+            }
             $this->scopes('allergies', 'read');
-            $rows = $this->execute("SELECT * FROM records WHERE resource = 'allergies' AND camper_id = ?", [(int) $camperId])->fetchAll();
+            $rows = $this->execute("SELECT * FROM records WHERE resource = 'allergies' AND camper_id = ? LIMIT 101", [(int) $camperId])->fetchAll();
+            if (count($rows) > 100) {
+                throw new ApiError(409, 'Too many dietary declarations; staff review required');
+            }
             foreach ($rows as $row) {
                 if ($this->accessible($row, 'read')) {
-                    $allergens[] = mb_strtolower(trim(decryptPayload($row['payload'], $this->config['key'])['allergen']));
+                    $allergens[] = mb_strtolower(trim(projectPayload($row['payload'], catalog()['allergies'], $this->config['key'])['allergen']));
                 }
             }
             $this->audit('allergies.evaluate', 'allergies');
+            $this->scopes('dietary_profiles', 'read');
+            $profiles = $this->execute("SELECT * FROM records WHERE resource = 'dietary_profiles' AND camper_id = ? LIMIT 101", [(int) $camperId])->fetchAll();
+            if (count($profiles) > 100) {
+                throw new ApiError(409, 'Too many dietary declarations; staff review required');
+            }
+            foreach ($profiles as $profile) {
+                if ($this->accessible($profile, 'read')) {
+                    foreach (projectPayload($profile['payload'], catalog()['dietary_profiles'], $this->config['key'])['excluded_ingredients'] as $ingredient) {
+                        $allergens[] = mb_strtolower(trim($ingredient));
+                    }
+                }
+            }
+            $this->audit('dietary_profiles.evaluate', 'dietary_profiles');
         }
         unset($_GET['camper_id']);
         $result = $this->listRecords('menus');

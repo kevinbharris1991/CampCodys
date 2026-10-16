@@ -19,6 +19,9 @@ function catalog(): array
         'campers' => $make('Camper administrative identity', 'identity', [
             'display_name' => $short, 'arrival_date' => $date, 'departure_date' => $date,
         ], ['display_name']),
+        'camper_names' => $make('Read-only dietary identity directory; camper IDs and display names only', 'none', [
+            'display_name' => $short,
+        ], ['display_name']),
         'reservations' => $make('Reservations', 'camper', [
             'arrival_date' => $date, 'departure_date' => $date,
             'status' => $status(['requested', 'confirmed', 'cancelled']),
@@ -83,7 +86,7 @@ function catalog(): array
         'behavioral_tracking' => $make('Behavioral observations and intervention tracking', 'camper', [
             'observed_at' => $datetime, 'observation' => $text, 'intervention' => $text,
         ], ['observed_at', 'observation']),
-        'consultation_notes' => $make('Behavioral consultation notes', 'camper', [
+        'consultation_notes' => $make('Counselor-facing consultation strategies; private details belong in restricted behavioral records', 'camper', [
             'consulted_on' => $date, 'note' => $text,
         ], ['consulted_on', 'note']),
         'behavior_health_context' => $make('Clinician-curated behavior-relevant health context; no full clinical chart', 'camper', [
@@ -177,7 +180,12 @@ function catalog(): array
         ], ['employee_reference', 'amount_cents', 'period_end']),
         'grants' => $make('Grant funding ledger', 'none', [
             'name' => $short, 'amount_cents' => $number, 'fiscal_year' => $short,
+            'application_status' => $status(['internal', 'available', 'closed']) + ['default' => 'internal'],
+            'application_instructions' => $text,
         ], ['name', 'amount_cents', 'fiscal_year']),
+        'grant_opportunities' => $make('Read-only available grant catalog; no funding amounts or fiscal data', 'none', [
+            'name' => $short, 'application_instructions' => $text,
+        ], ['name']),
         'public_content' => $make('Public and mission content drafts; publishing requires a separate approved workflow', 'none', [
             'title' => $short, 'body' => $text,
             'status' => $status(['draft', 'approved', 'published']),
@@ -190,7 +198,7 @@ function catalog(): array
             'status' => $status(['pending', 'approved', 'declined']), 'decision_note' => $text,
         ], ['reference', 'amount_cents', 'status']),
         'grant_applications' => $make('Grant applications; no health narratives', 'own', [
-            'grant_id' => $ref('grants'), 'requested_cents' => $number,
+            'grant_id' => $ref('grant_opportunities'), 'requested_cents' => $number,
             'statement' => $text, 'status' => $status(['submitted', 'approved', 'declined']),
         ], ['grant_id', 'requested_cents', 'statement', 'status']),
         'aggregate_reports' => $make('Manually approved nonidentifying aggregate reports', 'none', [
@@ -226,25 +234,30 @@ function roleGrants(): array
     $add(1, ['public_content'], $crud);
     $add(1, ['budgets', 'financial_approvals', 'grants', 'grant_applications'], $cru);
     $add(1, ['audit_events', 'configuration'], ['read']);
-    $add(2, ['campers', 'reservations', 'waivers', 'consents', 'demographics', 'rosters', 'policies', 'templates', 'staff_onboarding', 'compliance_reports'], $crud);
+    $add(1, ['grant_opportunities'], ['read']);
+    $add(2, ['campers', 'reservations', 'waivers', 'consents', 'demographics', 'rosters', 'policies', 'staff_onboarding', 'compliance_reports'], $cru);
+    $add(2, ['templates'], $crud);
     $add(2, ['aggregate_reports'], ['read', 'create', 'update']);
     $add(3, ['campers'], ['read']);
     $add(3, ['clinical_notes', 'prescriptions', 'allergies', 'care_profiles', 'dietary_profiles'], $crud);
-    $add(3, ['medication_schedules', 'medication_administrations', 'medication_stock', 'clinical_incidents', 'behavior_health_context', 'camper_safety_alerts'], $cru);
+    $add(3, ['medication_schedules'], $crud);
+    $add(3, ['medication_administrations', 'medication_stock', 'clinical_incidents', 'behavior_health_context', 'camper_safety_alerts'], $cru);
     $add(3, ['incidents', 'daily_logs', 'behavioral_plans'], ['read']);
     $add(3, ['incidents'], ['update']);
     $add(4, ['campers', 'behavior_health_context'], ['read']);
-    $add(4, ['behavioral_plans', 'behavioral_tracking', 'consultation_notes'], $cru);
+    $add(4, ['behavioral_plans'], $crud);
+    $add(4, ['behavioral_tracking', 'consultation_notes'], $cru);
     $add(5, ['campers'], ['read']);
     $add(5, ['accommodations'], ['read', 'update']);
     $add(5, ['equipment'], $crud);
     $add(5, ['facility_audits'], $cru);
     $add(5, ['work_orders'], ['read', 'create']);
     $add(6, ['campers', 'safety_notices', 'camper_safety_alerts'], ['read']);
-    $add(6, ['activities', 'activity_adaptations'], $crud);
+    $add(6, ['activities'], $crud);
+    $add(6, ['activity_adaptations'], $cru);
     $add(6, ['participation'], ['read', 'update']);
     $add(6, ['activity_signups'], ['read']);
-    $add(7, ['campers', 'care_profiles', 'daily_logs'], ['read'], 'assigned');
+    $add(7, ['campers', 'care_profiles', 'daily_logs', 'consultation_notes'], ['read'], 'assigned');
     $add(7, ['daily_logs', 'incidents'], ['create'], 'assigned');
     $add(8, ['work_orders', 'safety_notices', 'emergency_plans', 'emergency_alerts'], ['read', 'update']);
     $add(8, ['inspections'], $cru);
@@ -252,14 +265,18 @@ function roleGrants(): array
     $add(9, ['supply_requests'], ['read', 'create']);
     $add(9, ['safety_notices'], ['read']);
     $add(10, ['allergies', 'dietary_profiles'], ['read']);
+    $add(10, ['camper_names'], ['read']);
     $add(10, ['menus'], $cru);
     $add(10, ['special_meals'], ['read', 'update']);
     $add(11, ['billing', 'payroll', 'grants', 'grant_applications'], $crud);
     $add(11, ['budgets'], $cru);
     $add(11, ['financial_approvals'], ['read']);
+    $add(11, ['grant_opportunities'], ['read']);
     $add(11, ['aggregate_reports'], ['read', 'create', 'update']);
     $add(12, ['campers'], ['read'], 'own');
+    $add(12, ['dietary_profiles'], ['read'], 'own');
+    $add(12, ['billing'], ['read'], 'own');
     $add(12, ['reservations', 'accommodations', 'prescriptions', 'allergies', 'grant_applications', 'special_meals', 'activity_signups'], $cru, 'own');
-    $add(12, ['menus', 'activities', 'grants'], ['read'], 'published');
+    $add(12, ['menus', 'activities', 'grant_opportunities'], ['read'], 'published');
     return $grants;
 }

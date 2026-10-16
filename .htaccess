@@ -1,7 +1,7 @@
 Options -Indexes
+CGIPassAuth On
 RewriteEngine On
 
-RewriteRule ^ - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
 RewriteRule ^$ /public/ [R=302,L]
 RewriteRule ^(public|developers/api/v1)$ /$1/ [R=302,L]
 RewriteRule ^api/v1(?:/.*)?$ api/v1/index.php [END]

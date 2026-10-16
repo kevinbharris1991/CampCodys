@@ -5,6 +5,7 @@ require dirname(__DIR__) . '/api/v1/bootstrap.php';
 
 // Uses a disposable, uniquely named database and user. Never points the app at a live database.
 // TEST_MYSQL_DSN must be an administrative MySQL DSN without dbname, including charset=utf8mb4.
+// Race barriers also require access to performance_schema.data_locks and data_lock_waits.
 $dsn = getenv('TEST_MYSQL_DSN');
 if (!$dsn || !str_starts_with($dsn, 'mysql:') || str_contains($dsn, 'dbname=')) {
     fwrite(STDERR, "Set TEST_MYSQL_DSN (no dbname), TEST_MYSQL_USER and TEST_MYSQL_PASSWORD for a disposable MySQL test server.\n");
@@ -82,14 +83,21 @@ function cli(array $args, string $input = ''): array
     fclose($pipes[2]);
     return [proc_close($process), $stdout, $stderr];
 }
-function startServer(): string
+function startServer(bool $portal = false): string
 {
-    global $root, $servers;
+    global $root, $servers, $portalSessionDir;
     $socket = stream_socket_server('tcp://127.0.0.1:0', $error, $message);
     $address = stream_socket_get_name($socket, false);
     fclose($socket);
     $port = (int) substr(strrchr($address, ':'), 1);
-    $process = proc_open([PHP_BINARY, '-S', '127.0.0.1:' . $port, $root . '/tests/router.php'], [
+    if ($portal) {
+        $portalSessionDir = $root . '/.local/portal-sessions-' . bin2hex(random_bytes(6));
+        mkdir($portalSessionDir, 0700);
+    }
+    $command = $portal
+        ? [PHP_BINARY, '-d', 'session.save_path=' . $portalSessionDir, '-S', '127.0.0.1:' . $port, '-t', $root]
+        : [PHP_BINARY, '-S', '127.0.0.1:' . $port, $root . '/tests/router.php'];
+    $process = proc_open($command, [
         0 => ['pipe', 'r'], 1 => ['file', $root . '/.local/integration-server.log', 'a'],
         2 => ['file', $root . '/.local/integration-server.log', 'a'],
     ], $pipes, $root);
@@ -105,14 +113,159 @@ function startServer(): string
     }
     throw new RuntimeException('Server did not start');
 }
+
+function portalRequest(CurlHandle $curl, string $url, ?array $fields = null): array
+{
+    curl_setopt($curl, CURLOPT_URL, $url);
+    if ($fields === null) {
+        curl_setopt($curl, CURLOPT_HTTPGET, true);
+    } else {
+        curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => http_build_query($fields)]);
+    }
+    $html = curl_exec($curl);
+    if ($html === false) {
+        throw new RuntimeException('Portal request failed');
+    }
+    return [curl_getinfo($curl, CURLINFO_RESPONSE_CODE), $html];
+}
+
+function portalCsrf(string $html): string
+{
+    if (!preg_match('/name="csrf" value="([a-f0-9]{64})"/D', $html, $match)) {
+        throw new RuntimeException('Portal CSRF token missing');
+    }
+    return $match[1];
+}
+
+function portalResult(string $html): array
+{
+    if (!preg_match('~<h2>API result</h2>\s*<pre>(.*?)</pre>~s', $html, $match)) {
+        throw new RuntimeException('Portal API result missing');
+    }
+    return json_decode(html_entity_decode($match[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'), true, 32, JSON_THROW_ON_ERROR);
+}
+
+function portalNextForm(string $html, string $button): array
+{
+    preg_match_all('~<form\b[^>]*>(.*?)</form>~s', $html, $forms);
+    foreach ($forms[1] as $form) {
+        if (str_contains($form, '>' . $button . '</button>')) {
+            preg_match_all('~<input\b[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>~', $form, $fields, PREG_SET_ORDER);
+            $result = [];
+            foreach ($fields as $field) {
+                $result[$field[1]] = html_entity_decode($field[2], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            }
+            return $result;
+        }
+    }
+    throw new RuntimeException('Portal pagination control missing');
+}
+
 function login(int $user): string
 {
-    global $db, $password;
-    $db->exec('DELETE FROM rate_limits');
+    global $password;
     [$status, $response] = request('POST', '/auth/login', null, ['email' => "role$user@example.test", 'password' => $password]);
     expect($status === 200 && strlen($response['access_token'] ?? '') === 64 && $response['expires_in'] === 3600, 'login ' . $user);
     return $response['access_token'];
 }
+
+function waitForUserLock(PDO $admin, string $schema, bool $waiter, ?callable $tick = null): bool
+{
+    $sql = $waiter
+        ? "SELECT 1 FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l ON l.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID AND l.ENGINE = w.ENGINE WHERE l.OBJECT_SCHEMA = ? AND l.OBJECT_NAME = 'users' LIMIT 1"
+        : "SELECT 1 FROM performance_schema.data_locks WHERE OBJECT_SCHEMA = ? AND OBJECT_NAME = 'users' AND LOCK_TYPE = 'RECORD' LIMIT 1";
+    $query = $admin->prepare($sql);
+    for ($i = 0; $i < 300; $i++) {
+        if ($tick !== null) {
+            $tick();
+        }
+        $query->execute([$schema]);
+        if ($query->fetchColumn()) {
+            return true;
+        }
+        usleep(20000);
+    }
+    return false;
+}
+
+function passwordResetRace(PDO $admin, PDO $db, string $schema, int $user, string $email, string $oldPassword, string $newPassword): void
+{
+    global $root, $base, $clientToken, $clientSecret;
+    $process = null;
+    $pipes = [];
+    $multi = null;
+    $curl = null;
+    try {
+        // The real CLI locks the user before reading stdin; withhold EOF to hold that lock.
+        $process = proc_open([PHP_BINARY, $root . '/bin/console.php', 'password', (string) $user], [
+            0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
+        ], $pipes, $root);
+        expect(waitForUserLock($admin, $schema, false), 'concurrent reset CLI holds the user-row lock');
+        $curl = curl_init($base . '/api/v1/auth/login');
+        curl_setopt_array($curl, [
+            CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-API-Token: ' . $clientToken, 'X-API-Secret: ' . $clientSecret],
+            CURLOPT_POSTFIELDS => json_encode(['email' => $email, 'password' => $oldPassword], JSON_THROW_ON_ERROR),
+        ]);
+        $multi = curl_multi_init();
+        curl_multi_add_handle($multi, $curl);
+        $running = 0;
+        $tick = static function () use ($multi, &$running): void {
+            do {
+                $result = curl_multi_exec($multi, $running);
+            } while ($result === CURLM_CALL_MULTI_PERFORM);
+        };
+        expect(waitForUserLock($admin, $schema, true, $tick), 'login verified old hash and now waits for reset lock');
+        fwrite($pipes[0], $newPassword . "\n");
+        fclose($pipes[0]);
+        unset($pipes[0]);
+        foreach ($pipes as $pipe) {
+            stream_get_contents($pipe);
+            fclose($pipe);
+        }
+        $pipes = [];
+        $exit = proc_close($process);
+        $process = null;
+        expect($exit === 0, 'concurrent CLI reset commits and revokes sessions');
+        $deadline = microtime(true) + 10;
+        do {
+            $tick();
+            if ($running) {
+                curl_multi_select($multi, 0.05);
+            }
+        } while ($running && microtime(true) < $deadline);
+        expect(!$running && curl_getinfo($curl, CURLINFO_RESPONSE_CODE) === 401, 'stale verified password cannot mint a post-reset session');
+        $query = $db->prepare('SELECT password_hash FROM users WHERE id = ?');
+        $query->execute([$user]);
+        $currentHash = $query->fetchColumn();
+        expect(password_verify($newPassword, $currentHash) && !password_verify($oldPassword, $currentHash), 'stale bcrypt rehash cannot overwrite the committed reset hash');
+        $query = $db->prepare('SELECT COUNT(*) FROM sessions WHERE user_id = ? AND revoked_at IS NULL');
+        $query->execute([$user]);
+        expect((int) $query->fetchColumn() === 0, 'reset leaves no unrevoked stale-login session');
+    } finally {
+        foreach ($pipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+        if (is_resource($process)) {
+            if (proc_get_status($process)['running']) {
+                proc_terminate($process);
+            }
+            proc_close($process);
+        }
+        if ($multi !== null && $curl !== null) {
+            curl_multi_remove_handle($multi, $curl);
+        }
+        if ($curl !== null) {
+            curl_close($curl);
+        }
+        if ($multi !== null) {
+            curl_multi_close($multi);
+        }
+    }
+}
+
 try {
     if (!is_dir($root . '/.local')) {
         mkdir($root . '/.local', 0700);
@@ -157,12 +310,40 @@ try {
     expect($db->query('SELECT secret_hash FROM api_clients LIMIT 1')->fetchColumn() !== $clientSecret, 'client secret hashed');
     [$code, $output] = cli(['user', 'operator-created@example.test', 'Provisioned user'], $password . "\n");
     expect($code === 0 && isset(json_decode($output, true)['id']), 'CLI user provisioning');
+    $longPassword = bin2hex(random_bytes(36)) . str_repeat('z', 951) . 'x';
+    [$code, $output] = cli(['user', 'long-password@example.test', 'Long password test'], $longPassword . "\n");
+    expect($code === 0 && strlen($longPassword) === 1024, 'CLI accepts full 1024-byte password');
+    $longHash = $db->query("SELECT password_hash FROM users WHERE email = 'long-password@example.test'")->fetchColumn();
+    expect(password_get_info($longHash)['algoName'] === 'argon2id', 'CLI stores Argon2id, not bcrypt');
+    $differentLongPassword = substr($longPassword, 0, 1023) . 'y';
+    expect(password_verify($longPassword, $longHash) && !password_verify($differentLongPassword, $longHash), 'Argon2id distinguishes passwords after byte 72');
+    [$code] = cli(['user', 'too-long@example.test', 'Too long test'], $longPassword . 'x');
+    expect($code !== 0, 'CLI rejects password longer than 1024 bytes');
     [$code] = cli(['membership', '14', '8']);
     expect($code === 0, 'CLI role membership');
     $base = startServer();
     expect(request('POST', '/auth/login', null, ['email' => 'role1@example.test', 'password' => $password], false)[0] === 401, 'login requires client credentials');
     expect(request('GET', '/resources', null, null, false)[0] === 401, 'resources require client credentials');
     expect(request('GET', '/resources')[0] === 401, 'resources require session');
+    expect(request('POST', '/auth/login', null, ['email' => 'long-password@example.test', 'password' => $longPassword])[0] === 200, 'HTTP login accepts exact long password');
+    expect(request('POST', '/auth/login', null, ['email' => 'long-password@example.test', 'password' => $differentLongPassword])[0] === 401, 'HTTP login checks bytes beyond bcrypt boundary');
+    expect(request('POST', '/auth/login', null, ['email' => 'long-password@example.test', 'password' => $longPassword . 'x'])[0] === 422, 'HTTP login enforces 1024-byte maximum');
+    $legacyPassword = bin2hex(random_bytes(36));
+    $insert->execute(['legacy-password@example.test', 'Legacy hash migration test', password_hash($legacyPassword, PASSWORD_BCRYPT)]);
+    expect(request('POST', '/auth/login', null, ['email' => 'legacy-password@example.test', 'password' => $legacyPassword . 'ignored-suffix'])[0] === 401, 'ambiguous overlong bcrypt login fails closed');
+    expect(request('POST', '/auth/login', null, ['email' => 'legacy-password@example.test', 'password' => $legacyPassword])[0] === 200, 'unambiguous legacy bcrypt login can migrate');
+    $migratedHash = $db->query("SELECT password_hash FROM users WHERE email = 'legacy-password@example.test'")->fetchColumn();
+    expect(password_get_info($migratedHash)['algoName'] === 'argon2id', 'legacy bcrypt hash upgrades to Argon2id');
+    $raceOldPassword = bin2hex(random_bytes(16));
+    $raceNewPassword = bin2hex(random_bytes(16));
+    $insert->execute(['race-password@example.test', 'Password reset race test', password_hash($raceOldPassword, PASSWORD_BCRYPT)]);
+    $raceUser = (int) $db->lastInsertId();
+    $db->prepare('INSERT INTO sessions (user_id, client_id, token_hash, expires_at) VALUES (?, ?, ?, ?)')->execute([
+        $raceUser, $clientId, hash('sha256', random_bytes(32)), gmdate('Y-m-d H:i:s', time() + 3600),
+    ]);
+    passwordResetRace($admin, $db, $name, $raceUser, 'race-password@example.test', $raceOldPassword, $raceNewPassword);
+    expect(request('POST', '/auth/login', null, ['email' => 'race-password@example.test', 'password' => $raceOldPassword])[0] === 401, 'reset old password remains invalid');
+    expect(request('POST', '/auth/login', null, ['email' => 'race-password@example.test', 'password' => $raceNewPassword])[0] === 200, 'reset new password remains usable');
     $sessions = [];
     for ($role = 1; $role <= 15; $role++) {
         $sessions[$role] = login($role);
@@ -186,7 +367,7 @@ try {
     $empty = api('GET', '/auth/me', $sessions[15]);
     expect($empty['permissions'] === [], 'no implicit grants without membership');
     api('GET', '/records/campers', $sessions[15], null, 403);
-    $camper = api('POST', '/records/campers', $adminSession, ['owner_id' => 12, 'display_name' => 'First camper'], 201)['data']['id'];
+    $camper = api('POST', '/records/campers', $adminSession, ['owner_id' => 12, 'display_name' => 'First camper', 'arrival_date' => '2027-06-01', 'departure_date' => '2027-06-05'], 201)['data']['id'];
     $second = api('POST', '/records/campers', $adminSession, ['owner_id' => 13, 'display_name' => 'Second camper'], 201)['data']['id'];
     api('POST', '/records/campers', $adminSession, ['owner_id' => 12, 'display_name' => 'Camper', 'clinical_notes' => 'no'], 422);
     api('POST', '/records/campers', $adminSession, ['owner_id' => 99999, 'display_name' => 'Camper'], 422);
@@ -196,6 +377,11 @@ try {
     foreach ([1, 8, 9, 10, 11] as $role) {
         api('GET', '/records/campers', $sessions[$role], null, 403);
     }
+    $directory = api('GET', '/records/camper_names/' . $camper, $kitchen)['data'];
+    expect($directory === ['id' => $camper, 'display_name' => 'First camper'], 'dietary directory excludes ownership, dates and all other camper fields');
+    expect(count(api('GET', '/records/camper_names', $kitchen)['data']) === 2, 'dietary directory can resolve camper names');
+    api('GET', '/records/camper_names', $guest, null, 403);
+    api('PATCH', '/records/camper_names/' . $camper, $kitchen, ['display_name' => 'No edit'], 403);
     $note = api('POST', '/records/clinical_notes', $clinical, ['camper_id' => $camper, 'note' => 'Confidential clinical example', 'recorded_on' => gmdate('Y-m-d')], 201)['data']['id'];
     foreach ([1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12] as $role) {
         api('GET', '/records/clinical_notes/' . $note, $sessions[$role], null, 403);
@@ -230,6 +416,8 @@ try {
     $confirmed = api('POST', '/records/reservations', $adminSession, ['camper_id' => $camper, 'arrival_date' => '2027-01-01', 'departure_date' => '2027-01-02', 'status' => 'confirmed'], 201)['data']['id'];
     api('PATCH', '/records/reservations/' . $confirmed, $guest, ['departure_date' => '2027-02-01'], 403);
     api('DELETE', '/records/reservations/' . $confirmed, $guest, null, 403);
+    api('DELETE', '/records/reservations/' . $confirmed, $adminSession, null, 403);
+    api('DELETE', '/records/campers/' . $camper, $adminSession, null, 403);
     api('GET', '/records/prescriptions', $sessions[4], null, 403);
     api('GET', '/records/care_profiles/' . $care, $sessions[4], null, 403);
     api('GET', '/records/allergies', $kitchen);
@@ -252,6 +440,20 @@ try {
     $menus = api('GET', '/menus?camper_id=' . $camper, $guest);
     expect(count($menus['data']) === 1 && $menus['data'][0]['allergy_evaluation']['status'] === 'potential_conflict', 'guest menu allergy evaluation');
     api('GET', '/menus?camper_id=' . $second, $guest, null, 404);
+    $profile = api('POST', '/records/dietary_profiles', $clinical, ['camper_id' => $camper, 'instructions' => 'Dietary sensitivity instruction', 'excluded_ingredients' => ['Sesame']], 201)['data']['id'];
+    $otherProfile = api('POST', '/records/dietary_profiles', $clinical, ['camper_id' => $second, 'instructions' => 'Separate family sensitivity', 'excluded_ingredients' => ['Rice']], 201)['data']['id'];
+    api('GET', '/records/dietary_profiles/' . $profile, $guest);
+    api('GET', '/records/dietary_profiles/' . $otherProfile, $guest, null, 404);
+    $sensitivityMenu = api('POST', '/records/menus', $kitchen, array_replace($menuFields, ['name' => 'Sesame lunch', 'ingredients' => ['sesame'], 'allergens' => []]), 201)['data']['id'];
+    $evaluated = api('GET', '/menus?camper_id=' . $camper, $guest)['data'];
+    $byId = array_column($evaluated, null, 'id');
+    expect($byId[$sensitivityMenu]['allergy_evaluation']['status'] === 'potential_conflict', 'sensitivity exclusions match ingredients case-insensitively');
+    $evaluated = api('GET', '/menus?camper_id=' . $second, $other)['data'];
+    $byId = array_column($evaluated, null, 'id');
+    expect($byId[$menu]['allergy_evaluation']['status'] === 'potential_conflict', 'sensitivity-only conflict works without allergy records');
+    expect($byId[$sensitivityMenu]['allergy_evaluation']['status'] === 'no_declared_match', 'another family sensitivity never contaminates evaluation');
+    $evaluated = api('GET', '/menus?camper_id=' . $camper, $kitchen)['data'];
+    expect(count($evaluated) === 3, 'dietary staff can evaluate camper menus through minimal identity lookup');
     $special = api('POST', '/records/special_meals', $guest, ['camper_id' => $camper, 'menu_id' => $menu, 'request' => 'Milk-free meal', 'status' => 'requested'], 201)['data']['id'];
     api('GET', '/records/special_meals/' . $special, $other, null, 404);
     api('POST', '/records/special_meals', $guest, ['camper_id' => $camper, 'menu_id' => $draft, 'request' => 'No draft link', 'status' => 'requested'], 404);
@@ -282,12 +484,37 @@ try {
     api('GET', '/records/participation', $guest, null, 403);
     api('POST', '/records/participation', $program, ['camper_id' => $camper, 'activity_id' => $activity, 'status' => 'registered'], 403);
     $db->exec('DELETE FROM rate_limits');
-    $grant = api('POST', '/records/grants', $finance, ['name' => 'Access fund', 'amount_cents' => 50000, 'fiscal_year' => '2027'], 201)['data']['id'];
+    $grant = api('POST', '/records/grants', $finance, [
+        'name' => 'Access fund', 'amount_cents' => 50000, 'fiscal_year' => '2027',
+        'application_status' => 'available', 'application_instructions' => 'Submit a financial support application.',
+    ], 201)['data']['id'];
+    $internalGrant = api('POST', '/records/grants', $finance, ['name' => 'Internal fund allocation', 'amount_cents' => 90000, 'fiscal_year' => '2028'], 201)['data'];
+    expect($internalGrant['application_status'] === 'internal', 'grant ledger defaults to unpublished internal state');
+    $closedGrant = api('POST', '/records/grants', $finance, ['name' => 'Closed fund', 'amount_cents' => 70000, 'fiscal_year' => '2027', 'application_status' => 'closed'], 201)['data']['id'];
+    api('GET', '/records/grants', $guest, null, 403);
+    api('GET', '/records/grants/' . $grant, $guest, null, 403);
+    $grantCatalog = api('GET', '/records/grant_opportunities', $guest)['data'];
+    expect($grantCatalog === [[
+        'id' => $grant, 'name' => 'Access fund', 'application_instructions' => 'Submit a financial support application.',
+    ]], 'guest enumerates only available grants and no ledger amounts or fiscal fields');
+    api('GET', '/records/grant_opportunities/' . $internalGrant['id'], $guest, null, 404);
+    api('GET', '/records/grant_opportunities/' . $closedGrant, $guest, null, 404);
+    api('PATCH', '/records/grant_opportunities/' . $grant, $guest, ['name' => 'Cannot publish'], 403);
+    api('PATCH', '/records/grants/' . $internalGrant['id'], $guest, ['application_status' => 'available'], 403);
+    foreach ([$internalGrant['id'], $closedGrant] as $unavailableGrant) {
+        api('POST', '/records/grant_applications', $guest, ['grant_id' => $unavailableGrant, 'requested_cents' => 1000, 'statement' => 'Not available', 'status' => 'submitted'], 404);
+    }
     $application = api('POST', '/records/grant_applications', $guest, ['grant_id' => $grant, 'requested_cents' => 1000, 'statement' => 'Financial support request', 'status' => 'submitted'], 201)['data']['id'];
     api('GET', '/records/grant_applications/' . $application, $other, null, 404);
     api('POST', '/records/grant_applications', $guest, ['owner_id' => 13, 'grant_id' => $grant, 'requested_cents' => 1000, 'statement' => 'No', 'status' => 'submitted'], 403);
     api('PATCH', '/records/grant_applications/' . $application, $guest, ['status' => 'approved'], 403);
-    api('POST', '/records/billing', $finance, ['owner_id' => 12, 'reference' => 'INV-1', 'amount_cents' => 1000, 'status' => 'pending'], 201);
+    $bill = api('POST', '/records/billing', $finance, ['owner_id' => 12, 'reference' => 'INV-1', 'amount_cents' => 1000, 'status' => 'pending'], 201)['data']['id'];
+    $ownBalance = api('GET', '/records/billing/' . $bill, $guest)['data'];
+    expect($ownBalance['amount_cents'] === 1000 && $ownBalance['status'] === 'pending', 'guest can view own balance without changing payment state');
+    api('GET', '/records/billing/' . $bill, $other, null, 404);
+    api('POST', '/records/billing', $guest, ['reference' => 'INV-SELF', 'amount_cents' => 0, 'status' => 'paid'], 403);
+    api('PATCH', '/records/billing/' . $bill, $guest, ['status' => 'paid'], 403);
+    api('DELETE', '/records/billing/' . $bill, $guest, null, 403);
     api('POST', '/records/billing', $finance, ['reference' => 'INV-2', 'amount_cents' => 1000, 'status' => 'pending', 'card_number' => 'not-accepted'], 422);
     $report = api('POST', '/records/aggregate_reports', $finance, ['period' => '2027', 'occupancy_count' => 100, 'revenue_cents' => 100000], 201)['data']['id'];
     api('GET', '/records/aggregate_reports/' . $report, $sessions[1]);
@@ -300,6 +527,10 @@ try {
         'grant_id' => $grant, 'requested_cents' => 500, 'statement' => 'Staff applicant', 'status' => 'submitted',
     ], 201)['data']['id'];
     api('PATCH', '/records/grant_applications/' . $ownApplication, $sessions[1], ['status' => 'approved'], 403);
+    api('PATCH', '/records/grants/' . $grant, $finance, ['application_status' => 'closed']);
+    api('GET', '/records/grant_opportunities/' . $grant, $guest, null, 404);
+    expect(api('GET', '/records/grant_opportunities', $guest)['data'] === [], 'closed grant disappears from guest catalog');
+    api('PATCH', '/records/grant_applications/' . $ownApplication, $finance, ['status' => 'approved']);
     $configuration = api('GET', '/records/configuration/1', $sessions[1])['data'];
     expect($configuration['session_ttl_seconds'] === 3600 && !isset($configuration['DB_PASSWORD'], $configuration['APP_ENCRYPTION_KEY']), 'configuration exposes only safe limits');
     api('PATCH', '/records/configuration/1', $sessions[1], ['environment' => 'production'], 403);
@@ -325,6 +556,7 @@ try {
         $id = api('POST', '/records/' . $resource, $adminSession, ['camper_id' => $camper] + $fields, 201)['data']['id'];
         api('GET', '/records/' . $resource . '/' . $id, $adminSession);
         api('GET', '/records/' . $resource . '/' . $id, $sessions[1], null, 403);
+        api('DELETE', '/records/' . $resource . '/' . $id, $adminSession, null, 403);
     }
     foreach ([
         'policies' => ['title' => 'Arrival', 'body' => 'Arrival procedure', 'effective_on' => '2027-01-01'],
@@ -332,15 +564,20 @@ try {
         'staff_onboarding' => ['staff_reference' => 'STAFF-1', 'checklist' => ['Orientation'], 'status' => 'pending'],
         'compliance_reports' => ['period' => '2027', 'reviewed_items' => 20, 'open_items' => 2],
     ] as $resource => $fields) {
-        api('POST', '/records/' . $resource, $adminSession, $fields, 201);
+        $id = api('POST', '/records/' . $resource, $adminSession, $fields, 201)['data']['id'];
+        api('DELETE', '/records/' . $resource . '/' . $id, $adminSession, null, $resource === 'templates' ? 200 : 403);
     }
     $prescription = api('POST', '/records/prescriptions', $clinical, ['camper_id' => $camper, 'medication' => 'Synthetic medication', 'instructions' => 'Verified prescriber direction'], 201)['data']['id'];
     $scheduleFields = ['prescription_id' => $prescription, 'scheduled_at' => '2099-06-01T12:00:00Z', 'dose_instructions' => 'Verified instruction', 'status' => 'verified'];
     $schedule = api('POST', '/records/medication_schedules', $clinical, ['camper_id' => $camper] + $scheduleFields, 201)['data']['id'];
+    $unusedSchedule = api('POST', '/records/medication_schedules', $clinical, ['camper_id' => $camper] + $scheduleFields, 201)['data']['id'];
+    api('DELETE', '/records/medication_schedules/' . $unusedSchedule, $clinical);
     api('POST', '/records/medication_schedules', $clinical, ['camper_id' => $second] + $scheduleFields, 422);
     $sibling = api('POST', '/records/campers', $adminSession, ['owner_id' => 12, 'display_name' => 'Sibling camper'], 201)['data']['id'];
     api('POST', '/records/medication_schedules', $clinical, ['camper_id' => $sibling] + $scheduleFields, 422);
-    api('POST', '/records/medication_administrations', $clinical, ['camper_id' => $camper, 'schedule_id' => $schedule, 'recorded_at' => '2099-06-01T12:05:00Z', 'status' => 'given'], 201);
+    $administration = api('POST', '/records/medication_administrations', $clinical, ['camper_id' => $camper, 'schedule_id' => $schedule, 'recorded_at' => '2099-06-01T12:05:00Z', 'status' => 'given'], 201)['data']['id'];
+    api('DELETE', '/records/medication_schedules/' . $schedule, $clinical, null, 409);
+    api('DELETE', '/records/medication_administrations/' . $administration, $clinical, null, 403);
     api('POST', '/records/medication_administrations', $clinical, ['camper_id' => $second, 'schedule_id' => $schedule, 'recorded_at' => '2099-06-01T12:05:00Z', 'status' => 'given'], 422);
     api('POST', '/records/medication_stock', $clinical, ['medication' => 'Synthetic medication', 'lot_reference' => 'LOT-1', 'quantity_units' => 10, 'expires_on' => '2099-12-01'], 201);
     $clinicalIncident = api('POST', '/records/clinical_incidents', $clinical, ['camper_id' => $camper, 'occurred_at' => '2026-10-16T12:00:00Z', 'clinical_report' => 'Clinical-only incident detail'], 201)['data']['id'];
@@ -352,11 +589,26 @@ try {
     $context = api('POST', '/records/behavior_health_context', $clinical, ['camper_id' => $camper, 'relevant_precautions' => 'Curated relevant precaution only', 'reviewed_on' => '2026-10-16'], 201)['data']['id'];
     api('GET', '/records/behavior_health_context/' . $context, $sessions[4]);
     api('PATCH', '/records/behavior_health_context/' . $context, $sessions[4], ['relevant_precautions' => 'No clinical context editing'], 403);
-    api('POST', '/records/behavioral_tracking', $sessions[4], ['camper_id' => $camper, 'observed_at' => '2026-10-16T12:00:00Z', 'observation' => 'Behavioral observation'], 201);
-    api('POST', '/records/consultation_notes', $sessions[4], ['camper_id' => $camper, 'consulted_on' => '2026-10-16', 'note' => 'Consultation note'], 201);
+    $tracking = api('POST', '/records/behavioral_tracking', $sessions[4], ['camper_id' => $camper, 'observed_at' => '2026-10-16T12:00:00Z', 'observation' => 'Behavioral observation'], 201)['data']['id'];
+    api('DELETE', '/records/behavioral_tracking/' . $tracking, $sessions[4], null, 403);
+    $supportPlan = api('POST', '/records/behavioral_plans', $sessions[4], ['camper_id' => $camper, 'support_instructions' => 'Support plan example'], 201)['data']['id'];
+    api('DELETE', '/records/behavioral_plans/' . $supportPlan, $sessions[4]);
+    $strategy = api('POST', '/records/consultation_notes', $sessions[4], ['camper_id' => $camper, 'consulted_on' => '2026-10-16', 'note' => 'Counselor-facing support strategy'], 201)['data']['id'];
+    $unassignedStrategy = api('POST', '/records/consultation_notes', $sessions[4], ['camper_id' => $second, 'consulted_on' => '2026-10-16', 'note' => 'Unassigned camper strategy'], 201)['data']['id'];
+    expect(api('GET', '/records/consultation_notes/' . $strategy, $counselor)['data']['note'] === 'Counselor-facing support strategy', 'counselor can read assigned consultation strategies');
+    api('GET', '/records/consultation_notes/' . $unassignedStrategy, $counselor, null, 404);
+    expect(array_column(api('GET', '/records/consultation_notes', $counselor)['data'], 'id') === [$strategy], 'counselor strategy listing excludes unassigned campers');
+    api('PATCH', '/records/consultation_notes/' . $strategy, $counselor, ['note' => 'Not allowed'], 403);
+    api('DELETE', '/records/consultation_notes/' . $strategy, $counselor, null, 403);
+    api('POST', '/records/consultation_notes', $counselor, ['camper_id' => $camper, 'consulted_on' => '2026-10-16', 'note' => 'Not allowed'], 403);
+    api('GET', '/records/behavioral_plans', $counselor, null, 403);
+    api('GET', '/records/behavioral_tracking', $counselor, null, 403);
     $safety = api('POST', '/records/camper_safety_alerts', $clinical, ['camper_id' => $camper, 'precaution' => 'Activity precaution', 'instructions' => 'Curated activity safety instruction', 'reviewed_on' => '2026-10-16'], 201)['data']['id'];
     api('GET', '/records/camper_safety_alerts/' . $safety, $program);
     api('GET', '/records/care_profiles/' . $care, $program, null, 403);
+    $adaptation = api('POST', '/records/activity_adaptations', $program, ['camper_id' => $camper, 'activity_id' => $activity, 'instructions' => 'Adaptive activity instructions'], 201)['data']['id'];
+    api('PATCH', '/records/activity_adaptations/' . $adaptation, $program, ['instructions' => 'Reviewed adaptation']);
+    api('DELETE', '/records/activity_adaptations/' . $adaptation, $program, null, 403);
     api('POST', '/records/accommodations', $sessions[5], ['camper_id' => $camper, 'request' => 'No create', 'status' => 'requested'], 403);
     $facilityAudit = api('POST', '/records/facility_audits', $sessions[5], ['location' => 'Building A', 'audited_on' => '2026-10-16', 'findings' => 'Accessible entry', 'status' => 'open'], 201)['data']['id'];
     api('PATCH', '/records/facility_audits/' . $facilityAudit, $sessions[5], ['status' => 'complete']);
@@ -418,16 +670,171 @@ try {
     api('GET', '/auth/me', $limitedGuest, null, 401);
     $clientToken = $fullToken;
     $clientSecret = $fullSecret;
+    $db->exec('DELETE FROM rate_limits');
+    $portalActivity = api('POST', '/records/activities', $program, array_replace($activityFields, ['name' => 'Portal adaptive games', 'capacity' => 2]), 201)['data']['id'];
+    api('POST', '/records/special_meals', $guest, ['camper_id' => $sibling, 'menu_id' => $menu, 'request' => 'SIBLING PRIVATE MEAL', 'status' => 'requested'], 201);
+    api('POST', '/records/special_meals', $other, ['camper_id' => $second, 'menu_id' => $menu, 'request' => 'OTHER FAMILY PRIVATE MEAL', 'status' => 'requested'], 201);
+    $portalAssertionsStart = $count;
+    putenv('APP_ENV=development');
+    putenv('PORTAL_API_BASE_URL=' . $base . '/api/v1');
+    putenv('PORTAL_API_TOKEN=' . $clientToken);
+    putenv('PORTAL_API_SECRET=' . $clientSecret);
+    $portalUrl = startServer(true) . '/public/index.php';
+    putenv('APP_ENV=test');
+    $browser = curl_init();
+    curl_setopt_array($browser, [CURLOPT_RETURNTRANSFER => true, CURLOPT_COOKIEFILE => '', CURLOPT_TIMEOUT => 15]);
+    [$status, $html] = portalRequest($browser, $portalUrl);
+    expect($status === 200 && str_contains($html, 'Staff &amp; guest sign in'), 'portal serves login form with configured process environment');
+    $beforeLoginCsrf = portalCsrf($html);
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => $beforeLoginCsrf, 'action' => 'login', 'email' => 'role12@example.test', 'password' => $password,
+    ]);
+    expect($status === 200 && str_contains($html, 'Signed in as Test role 12.'), 'portal login reaches authenticated API');
+    expect(portalCsrf($html) !== $beforeLoginCsrf, 'portal rotates CSRF after successful login');
+    expect(!str_contains($html, $clientToken) && !str_contains($html, $clientSecret) && !str_contains($html, $password), 'portal never renders client credentials or password');
+    $portalSession = (int) $db->query('SELECT MAX(id) FROM sessions WHERE user_id = 12')->fetchColumn();
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'record', 'resource' => 'campers', 'method' => 'GET', 'record_id' => '',
+    ]);
+    expect($status === 200 && str_contains($html, 'First camper') && !str_contains($html, 'Second camper'), 'portal camper lookup respects household ownership');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'record', 'resource' => 'special_meals', 'method' => 'POST', 'record_id' => '',
+        'payload' => json_encode(['camper_id' => $camper, 'menu_id' => $menu, 'request' => 'Portal milk-free <b>request</b>', 'status' => 'requested']),
+    ]);
+    $portalMeal = portalResult($html)['data'];
+    expect($status === 200 && $portalMeal['camper_id'] === $camper && $portalMeal['status'] === 'requested', 'portal flat-JSON editor creates own special meal');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'menus', 'camper_id' => $camper,
+    ]);
+    expect($status === 200 && str_contains($html, '<s>Lunch</s>') && str_contains($html, '<s>Sesame lunch</s>'), 'portal strikes allergy and sensitivity conflicts');
+    expect(str_contains($html, 'Your special meal') && str_contains($html, 'Portal milk-free &lt;b&gt;request&lt;/b&gt;'), 'portal displays own special meal with HTML escaping');
+    expect(!str_contains($html, 'SIBLING PRIVATE MEAL') && !str_contains($html, 'OTHER FAMILY PRIVATE MEAL'), 'portal meal view filters both camper and family ownership');
+    expect(!str_contains($html, 'Portal milk-free <b>request</b>'), 'portal special-meal content cannot inject markup');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'activities',
+    ]);
+    expect($status === 200 && str_contains($html, 'Portal adaptive games'), 'portal activity listing reaches API');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'signup', 'record_id' => $portalActivity, 'camper_id' => $camper,
+    ]);
+    $portalSignup = portalResult($html)['data'];
+    expect($status === 200 && $portalSignup['camper_id'] === $camper && $portalSignup['activity_id'] === $portalActivity, 'portal enrolls own camper through signup route');
+    $portalEnrollment = $db->prepare('SELECT COUNT(*) FROM activity_enrollments WHERE activity_id = ? AND camper_id = ?');
+    $portalEnrollment->execute([$portalActivity, $camper]);
+    expect((int) $portalEnrollment->fetchColumn() === 1, 'portal signup persists enrollment in MySQL');
+    // Seed bounded synthetic pages directly; all UI reads still go through the real scoped API.
+    $pageFixtures = [
+        'menus' => [null, null, 'published', array_replace($menuFields, ['name' => 'Portal paged menu'])],
+        'special_meals' => [12, $camper, '', ['menu_id' => $menu, 'request' => 'Portal paged meal', 'status' => 'requested']],
+        'activities' => [null, null, 'available', array_replace($activityFields, ['name' => 'Portal paged activity'])],
+        'reservations' => [12, $camper, '', ['arrival_date' => '2099-06-01', 'departure_date' => '2099-06-05', 'status' => 'requested']],
+    ];
+    $fixtureInsert = $db->prepare('INSERT INTO records (resource, owner_id, camper_id, visibility, payload) VALUES (?, ?, ?, ?, ?)');
+    $fixtureLink = $db->prepare("INSERT INTO record_links (record_id, field_name, target_id) VALUES (?, 'menu_id', ?)");
+    $db->beginTransaction();
+    for ($i = 1; $i <= 55; $i++) {
+        foreach ($pageFixtures as $resource => [$fixtureOwner, $fixtureCamper, $visibility, $payload]) {
+            foreach (['name', 'request'] as $field) {
+                if (isset($payload[$field])) {
+                    $payload[$field] .= ' ' . $i;
+                }
+            }
+            $payload = \Camp\validateFields($payload, \Camp\catalog()[$resource]);
+            $fixtureInsert->execute([$resource, $fixtureOwner, $fixtureCamper, $visibility, \Camp\encryptPayload($payload, $key)]);
+            if ($resource === 'special_meals') {
+                $fixtureLink->execute([(int) $db->lastInsertId(), $menu]);
+            }
+        }
+    }
+    $db->commit();
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'menus', 'camper_id' => $camper,
+    ]);
+    $firstMenuPage = portalResult($html);
+    expect($status === 200 && count($firstMenuPage['data']) === 50
+        && str_contains($html, 'Next menus') && str_contains($html, 'Next special meals'), 'portal exposes both menu and special-meal pagination');
+    $nextMenus = portalNextForm($html, 'Next menus');
+    [$status, $html] = portalRequest($browser, $portalUrl, $nextMenus);
+    $nextMenuPage = portalResult($html);
+    expect($status === 200 && $nextMenuPage['data'] && $nextMenuPage['next_after'] === null
+        && min(array_column($nextMenuPage['data'], 'id')) > (int) $nextMenus['menu_after'], 'portal advances menus without repeating records');
+    $nextSpecialMeals = portalNextForm($html, 'Next special meals');
+    expect($nextSpecialMeals['menu_after'] === $nextMenus['menu_after'], 'special-meal navigation preserves independent menu cursor');
+    [$status, $html] = portalRequest($browser, $portalUrl, $nextSpecialMeals);
+    expect($status === 200 && str_contains($html, 'Portal paged meal 55')
+        && !str_contains($html, 'Portal paged meal 1 (') && portalResult($html)['data'] === $nextMenuPage['data'], 'portal advances special meals while preserving menu page');
+    [$status, $html] = portalRequest($browser, $portalUrl, ['csrf' => portalCsrf($html), 'action' => 'activities']);
+    expect($status === 200 && count(portalResult($html)['data']) === 50 && str_contains($html, 'Next activities'), 'portal exposes available-activity pagination');
+    $nextActivities = portalNextForm($html, 'Next activities');
+    [$status, $html] = portalRequest($browser, $portalUrl, $nextActivities);
+    $nextActivityPage = portalResult($html);
+    expect($status === 200 && $nextActivityPage['data'] && $nextActivityPage['next_after'] === null
+        && min(array_column($nextActivityPage['data'], 'id')) > (int) $nextActivities['after'], 'portal advances available activities without repeating records');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'record', 'resource' => 'reservations', 'method' => 'GET', 'record_id' => '',
+    ]);
+    $firstRecordPage = portalResult($html);
+    expect($status === 200 && count($firstRecordPage['data']) === 50 && is_int($firstRecordPage['next_after']), 'portal generic record listing returns usable cursor');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'record', 'resource' => 'reservations', 'method' => 'GET',
+        'record_id' => '', 'after' => $firstRecordPage['next_after'],
+    ]);
+    $nextRecordPage = portalResult($html);
+    expect($status === 200 && $nextRecordPage['data'] && $nextRecordPage['next_after'] === null
+        && min(array_column($nextRecordPage['data'], 'id')) > $firstRecordPage['next_after'], 'portal generic record editor forwards page cursor correctly');
+    [$status, $html] = portalRequest($browser, $portalUrl, [
+        'csrf' => portalCsrf($html), 'action' => 'logout',
+    ]);
+    expect($status === 200 && str_contains($html, 'Staff &amp; guest sign in') && !str_contains($html, 'Signed in as'), 'portal logout returns to login view');
+    $revoked = $db->prepare('SELECT revoked_at FROM sessions WHERE id = ?');
+    $revoked->execute([$portalSession]);
+    $revocationTime = $revoked->fetchColumn();
+    expect(is_string($revocationTime) && $revocationTime !== '', 'portal logout revokes API session');
+    $sharedPortalUsers = [];
+    for ($role = 1; $role <= 12; $role++) {
+        [$status, $html] = portalRequest($browser, $portalUrl, [
+            'csrf' => portalCsrf($html), 'action' => 'login', 'email' => "role$role@example.test", 'password' => $password,
+        ]);
+        expect($status === 200 && str_contains($html, 'Signed in as Test role ' . $role . '.'), 'shared portal egress allows valid login ' . $role);
+        $sharedPortalUsers[] = $role;
+        [$status, $html] = portalRequest($browser, $portalUrl, ['csrf' => portalCsrf($html), 'action' => 'logout']);
+        expect($status === 200 && str_contains($html, 'Staff &amp; guest sign in'), 'shared portal user can sign out ' . $role);
+    }
+    expect(count(array_unique($sharedPortalUsers)) > 10, 'more than ten distinct valid portal users authenticate without resetting rate counters');
+    curl_close($browser);
+    $portalAssertions = $count - $portalAssertionsStart;
     api('POST', '/auth/logout', $guest);
     api('GET', '/auth/me', $guest, null, 401);
     $expired = login(12);
     $db->prepare('UPDATE sessions SET expires_at = UTC_TIMESTAMP() - INTERVAL 1 SECOND WHERE token_hash = ?')->execute([hash('sha256', $expired)]);
     api('GET', '/auth/me', $expired, null, 401);
     $db->exec('DELETE FROM rate_limits');
-    for ($i = 0; $i < 10; $i++) {
+    for ($i = 0; $i < 15; $i++) {
         expect(request('POST', '/auth/login', null, ['email' => 'unknown@example.test', 'password' => 'incorrect-password'])[0] === 401, 'failed login ' . $i);
     }
-    expect(request('POST', '/auth/login', null, ['email' => 'unknown@example.test', 'password' => 'incorrect-password'])[0] === 429, 'persistent login rate limit');
+    expect(request('POST', '/auth/login', null, ['email' => 'unknown@example.test', 'password' => 'incorrect-password'])[0] === 429, 'persistent account-level brute-force rate limit');
+    $db->exec('DELETE FROM rate_limits');
+    for ($i = 0; $i < 2; $i++) {
+        expect(request('POST', '/auth/login', null, ['email' => "unknown-network-$i@example.test", 'password' => 'incorrect-password'])[0] === 401, 'network budget records actual credential failure ' . $i);
+    }
+    $failureBucket = static fn(int $window): string => hash('sha256', 'login-failures:'
+        . hash_hmac('sha256', '127.0.0.1', $key) . ':' . $window);
+    $window = intdiv(time(), 900);
+    $failureCount = $db->prepare('SELECT COALESCE(SUM(hits), 0) FROM rate_limits WHERE bucket IN (?, ?)');
+    $failureCount->execute([$failureBucket($window), $failureBucket($window - 1)]);
+    expect((int) $failureCount->fetchColumn() === 2, 'network failure budget counts failures only');
+    $seedBudget = $db->prepare('INSERT INTO rate_limits (bucket, hits, expires_at) VALUES (?, 100, ?) ON DUPLICATE KEY UPDATE hits = 100');
+    foreach ([$window, $window + 1] as $budgetWindow) {
+        $seedBudget->execute([$failureBucket($budgetWindow), gmdate('Y-m-d H:i:s', time() + 1800)]);
+    }
+    expect(request('POST', '/auth/login', null, ['email' => 'another-network-failure@example.test', 'password' => 'incorrect-password'], true, [
+        'X-Forwarded-For: 203.0.113.99', 'Forwarded: for=203.0.113.99',
+    ])[0] === 429, 'exhausted network failure budget throttles failures and ignores spoofed forwarding headers');
+    $failureCount->execute([$failureBucket($window), $failureBucket($window + 1)]);
+    $beforeSuccess = (int) $failureCount->fetchColumn();
+    expect(request('POST', '/auth/login', null, ['email' => 'role2@example.test', 'password' => $password])[0] === 200, 'valid credentials remain usable after shared network failure budget is exhausted');
+    $failureCount->execute([$failureBucket($window), $failureBucket($window + 1)]);
+    expect((int) $failureCount->fetchColumn() === $beforeSuccess, 'successful authentication does not consume network failure budget');
     $db->exec('DELETE FROM rate_limits');
     putenv('APP_ENV=production');
     putenv('APP_REQUIRE_TLS=true');
@@ -440,11 +847,17 @@ try {
     api('GET', '/auth/me', $clinical, null, 401);
     [$code] = cli(['cleanup']);
     expect($code === 0, 'CLI cleanup');
-    echo "PASS: $count MySQL/HTTP integration assertions\n";
+    echo "PASS: $count MySQL/HTTP/portal integration assertions ($portalAssertions portal assertions)\n";
 } finally {
     foreach ($servers as $server) {
         proc_terminate($server);
         proc_close($server);
+    }
+    if (isset($portalSessionDir) && is_dir($portalSessionDir)) {
+        foreach (glob($portalSessionDir . '/sess_*') as $sessionFile) {
+            unlink($sessionFile);
+        }
+        rmdir($portalSessionDir);
     }
     $db = null;
     $admin->exec("DROP DATABASE IF EXISTS `$name`");

@@ -132,12 +132,15 @@ is not permitted in production. Do not expose either port publicly.
 ## Web server
 
 Use Apache 2.4 with `mod_rewrite`, TLS, and permission to apply the supplied
-`.htaccess` (`AllowOverride FileInfo Options`, including authorization to use
+`.htaccess` (`AllowOverride FileInfo Options AuthConfig`, including authorization to use
 `Options -Indexes`). Point the virtual host document root at this repository.
 The allowlist exposes only the API front controller, portal and developer page;
 everything else, including `.env`, source modules, SQL, tests, CLI and `.git`,
 must be inaccessible over HTTP. If `.htaccess` is disabled, configure equivalent
 rules in the virtual host **before** serving this directory.
+Configure a working PHP-FPM or mod_php handler for the two PHP front
+controllers; PHP CLI alone is insufficient. Verify PHP executes and is never
+served as source before enabling public access.
 
 For Nginx or another server, explicitly route `/api/v1` and its subpaths to
 `api/v1/index.php`, allow `/public/index.php`, `/public/style.css` and
@@ -150,7 +153,13 @@ terminator. Do not pass through unvalidated `X-Forwarded-Proto`. Restrict the
 upstream network to the proxy. Disable PHP error display and avoid logging
 request/response bodies or credentials. Use private PHP session storage with
 short garbage-collection lifetime and appropriate permissions. The portal
-requires server-side access to its configured API URL.
+requires server-side access to its configured API URL. Run PHP under an
+unprivileged identity with read-only access to application source/configuration;
+keep writable session/log directories outside the document root.
+Apply per-visitor rate limits at the public reverse proxy as well: API traffic
+from this server-rendered portal shares the portal server's network address and
+general API request quotas. Do not solve this by trusting arbitrary forwarded
+IP headers.
 
 The PHP built-in server is for isolated local development **only**. It does not
 enforce `.htaccess`; never expose the repository's built-in server to a network

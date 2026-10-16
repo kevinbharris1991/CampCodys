@@ -69,6 +69,14 @@ Do not infer record existence from forbidden/not-found responses. Never show raw
 Administrative role assignment and credential recovery are intentionally CLI-controlled in this foundation; the portal cannot grant itself access.</p>
 <p>Executive readers can use <code>GET /records/audit_events</code> and <code>GET /records/configuration</code>
 for sanitized, read-only operational information. Configuration never returns secrets. Audits contain event metadata, not clinical content.</p>
+<p>Dietary staff use <code>GET /records/camper_names</code> (or <code>/{id}</code>) to cross-reference meals.
+This projection returns only camper ID and display name, not the broader camper record or clinical history.</p>
+<p>Guests discover grants through <code>GET /records/grant_opportunities</code> (or <code>/{id}</code>),
+which returns only <code>id</code>, <code>name</code> and optional <code>application_instructions</code>.
+The finance <code>grants</code> ledger remains inaccessible. Finance publishes opportunities by setting
+<code>application_status</code> to <code>available</code>; grants default to <code>internal</code> and can be
+<code>closed</code>. Use the catalog ID as <code>grant_id</code> in an application. Closed/internal grants
+cannot receive new guest applications, while authorized reviewers can finish existing applications after closure.</p>
 <ol>
 <li><strong>Executive Director:</strong> configuration/audit visibility and aggregate camper reporting; financial approvals, budgets/grants, and public/mission content. No raw clinical records.</li>
 <li><strong>Administrative Directors:</strong> administrative intake, consent/waivers, household demographics, rosters/cabins, policies, onboarding, templates and compliance reports. Trusted CLI handles account/role changes.</li>
@@ -81,7 +89,7 @@ for sanitized, read-only operational information. Configuration never returns se
 <li><strong>Housekeeping:</strong> sanitation rosters, sensory-room setup and supply requests; no camper records.</li>
 <li><strong>Catering &amp; Dietary Support:</strong> dietary restrictions, menu planning and special meals; no general health or behavioral records.</li>
 <li><strong>Finance &amp; Accounting:</strong> billing, payroll, grant funds and financial reporting; no clinical or behavioral records.</li>
-<li><strong>Guest:</strong> own reservations, accommodations, prescription disclosures, allergies, grant applications and activity signups; read guest-facing menus/events and own special meals only.</li>
+<li><strong>Guest:</strong> own reservations, accommodations, prescription disclosures, allergies, grant applications and activity signups; read guest-facing menus/events, own balances and own special meals only.</li>
 </ol>
 <p>“Read only” does not imply unrestricted access. A counselor's reads are assignment-scoped; a guest's reads and writes are owner-scoped.
 Users with several groups receive the union of their explicitly granted capabilities. Assign only necessary groups and regularly review combinations.</p>
@@ -127,6 +135,7 @@ unknown ingredients, cross-contact, texture requirements, medication interaction
 The portal strikes through flagged meals and shows the guest's special meal. Do not serve a meal based solely on automated matching.</p>
 <p>Reservation balances and billing records are bookkeeping only. Actual payments/refunds must use a compliant external payment
 processor with tokenized references; never submit card numbers, CVVs, bank credentials or insurance identifiers in free text.
+Guests can read their own <code>billing</code> records but cannot mark them paid or change amounts.
 Grant applications are distinct from finance allocation/approval records. A guest's own grant application does not grant access to finance reports.</p>
 </section>
 <section id="examples">
@@ -338,6 +347,8 @@ disable departed users, revoke compromised clients/sessions and rotate secrets t
 <li>Protect audit storage against runtime alteration using restricted grants and remote immutable retention.
 Monitor denied access, abnormal reads, login failures, exports, and privileged CLI changes.
 Audit metadata is still sensitive; do not log request/response bodies, passwords, headers or session tokens.</li>
+<li>Configure web/proxy access logs to omit query strings and record identifiers, or protect them as sensitive metadata with
+restricted access and an approved retention policy. REST paths can reveal that a user accessed a health-related resource.</li>
 <li>Set retention, legal-hold, backup and deletion policies before enabling destructive operations.
 Use minimum-necessary data, verified guardian relationships and explicit policies for camper access.</li>
 <li>Obtain applicable business associate agreements, perform a documented risk assessment, train staff,
