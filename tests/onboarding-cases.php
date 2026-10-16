@@ -14,7 +14,7 @@ function signupFixture(string $email): array
     $db->exec('DELETE FROM rate_limits');
     $before = is_file($mailCapture) ? strlen(file_get_contents($mailCapture)) : 0;
     $fields = ['name' => 'Registration Test', 'date_of_birth' => '1996-04-15', 'email' => $email,
-        'gender' => 'Prefer not to say', 'terms_accepted' => true, 'privacy_accepted' => true];
+        'gender' => 'prefer_not_to_say', 'terms_accepted' => true, 'privacy_accepted' => true];
     $response = authCall('register', $fields, 200, ['Host: untrusted.example.test', 'X-Forwarded-Host: evil.example.test']);
     $mail = substr(file_get_contents($mailCapture), $before);
     expect((bool) preg_match('~https://registration\.example\.test/public/\?activate=([a-f0-9]{64})~', $mail, $match), 'activation uses fixed trusted origin');
@@ -60,11 +60,11 @@ function authRace(string $path, array $body): array
 $onboardingStart = $count;
 try {
     $registration = ['name' => 'Registration Test', 'date_of_birth' => '1996-04-15', 'email' => 'new-guest@example.test',
-        'gender' => 'Prefer not to say', 'terms_accepted' => true, 'privacy_accepted' => true];
+        'gender' => 'prefer_not_to_say', 'terms_accepted' => true, 'privacy_accepted' => true];
     foreach ([
         ['terms_accepted' => false], ['privacy_accepted' => false], ['terms_accepted' => 'true'],
         ['date_of_birth' => '2025-02-30'], ['date_of_birth' => '2099-01-01'], ['email' => "no\r\nBcc:bad@example.test"],
-        ['name' => ''], ['gender' => ['invalid']], ['role_id' => 1],
+        ['name' => ''], ['gender' => ['invalid']], ['gender' => 'unsupported'], ['role_id' => 1],
     ] as $invalid) {
         authCall('register', array_replace($registration, $invalid), 422);
     }

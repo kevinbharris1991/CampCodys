@@ -95,8 +95,8 @@ trait RegistrationAuth
         if (!is_string($body['email']) || strlen($body['email']) > 254 || !filter_var(trim($body['email']), FILTER_VALIDATE_EMAIL)) {
             throw new ApiError(422, 'A valid email address is required');
         }
-        if (!$this->authText($body['gender'], 60)) {
-            throw new ApiError(422, 'Gender must be nonempty text of at most 60 characters');
+        if (!is_string($body['gender']) || !in_array($body['gender'], ['female', 'male', 'non_binary', 'self_described', 'prefer_not_to_say'], true)) {
+            throw new ApiError(422, 'Gender must be female, male, non_binary, self_described or prefer_not_to_say');
         }
         if ($body['terms_accepted'] !== true || $body['privacy_accepted'] !== true) {
             throw new ApiError(422, 'Terms and privacy policy must each be accepted separately');

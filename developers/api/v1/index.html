@@ -50,9 +50,10 @@ it creates only a Guest membership. Only trusted operators may grant staff acces
 <ol>
 <li><code>POST /auth/register</code> with exactly:
 <pre>{"name":"Alex Example","date_of_birth":"1996-04-15","email":"alex@example.org",
- "gender":"Prefer not to say","terms_accepted":true,"privacy_accepted":true}</pre>
-Name is nonempty text up to 120 characters; gender is nonempty text up to 60 characters, including a free-text or
-prefer-not-to-say answer. Date of birth is a real YYYY-MM-DD date between 1900-01-01 and today (UTC).
+ "gender":"prefer_not_to_say","terms_accepted":true,"privacy_accepted":true}</pre>
+Name is nonempty text up to 120 characters; gender must be one of <code>female</code>, <code>male</code>,
+<code>non_binary</code>, <code>self_described</code> or <code>prefer_not_to_say</code>.
+Date of birth is a real YYYY-MM-DD date between 1900-01-01 and today (UTC).
 Each acceptance must independently be the JSON boolean <code>true</code>; separate acceptance timestamps are retained.
 The response is always the same eligibility-neutral <code>{"message":"..."}</code> for valid new or duplicate addresses.
 Duplicate live registrations are not reset or resent. Expired incomplete registrations can be restarted.</li>
