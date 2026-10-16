@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+/.local/
+/coverage/
+*.log
