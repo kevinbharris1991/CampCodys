@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Camp Cody's API v1 · Developer Reference</title>
+<link rel="stylesheet" href="/public/style.css">
+</head>
+<body>
+<header><p class="eyebrow">Camp Cody's · Developers</p><h1>API v1</h1><p>PHP / MySQL · Deny-by-default access · Minimum-necessary records</p></header>
+<main>
+<nav aria-label="Contents"><a href="#authentication">Authentication</a> · <a href="#endpoints">Endpoints</a> ·
+<a href="#roles">Groups</a> · <a href="#records">Records</a> · <a href="#examples">Client examples</a> · <a href="#security">Security</a> · <a href="/public/">Portal</a></nav>
+<section>
+<h2>Scope and readiness</h2>
+<p>This is an API foundation, not a certified electronic health record, payment processor, or complete camp management product.
+It supplies authentication, database-backed group membership, a resource permission matrix, scoped CRUD, and guest meal/activity views.
+Clinical review, MFA/identity-provider integration, business approvals, operational monitoring, and independent security testing are production prerequisites.</p>
+<p><strong>HIPAA compliance is an organizational responsibility, not a property guaranteed by this code.</strong>
+Do not load real protected health information (PHI) until the deployment safeguards below are in place.
+No code or hosting vendor can establish compliance merely by calling an API “secure.”</p>
+</section>
+<section id="authentication">
+<h2>Authentication</h2>
+<p>Base URL: <code>https://your-camp-host/api/v1</code>. All requests require an API client token and secret.
+Provision credentials using the trusted CLI; do not embed shared secrets in public JavaScript or ship a shared production secret inside mobile binaries.
+Use a trusted application gateway for mobile/browser deployments. Mobile samples show the HTTP contract only; supply short-lived, appropriately provisioned credentials through your secure architecture.</p>
+<pre>X-API-Token: &lt;client token&gt;
+X-API-Secret: &lt;client secret&gt;
+Accept: application/json
+Content-Type: application/json</pre>
+<p>Sign in with <code>POST /auth/login</code>:</p>
+<pre>{"email":"guest@example.org","password":"&lt;user password&gt;"}</pre>
+<p>The response contains <code>access_token</code> and <code>expires_in</code>. For subsequent requests also send
+<code>Authorization: Bearer&#32;&lt;access_token&gt;</code>. The client credentials alone do not grant user permissions.
+Treat bearer tokens as secrets; never put any credentials in query strings, analytics, crash reports, or logs.</p>
+<p><code>GET /auth/me</code> returns the signed-in user, assigned groups, and effective permissions.
+Permissions are additive across memberships, with record scopes enforced on every operation.
+Signing out via <code>POST /auth/logout</code> revokes the current session. Handle HTTP 401 by signing in again; do not retry passwords automatically.</p>
+</section>
+<section id="endpoints">
+<h2>Endpoint reference</h2>
+<dl>
+<dt><code>POST /auth/login</code></dt><dd>Client credentials plus email/password; creates an expiring user session.</dd>
+<dt><code>GET /auth/me</code></dt><dd>Current user, database memberships, effective permissions.</dd>
+<dt><code>POST /auth/logout</code></dt><dd>Revokes the presented bearer token.</dd>
+<dt><code>GET /resources</code></dt><dd>Authorized resource schemas and permitted operations. Use this as the live field reference.</dd>
+<dt><code>GET /records/{resource}</code></dt><dd>List accessible records. The server applies ownership/assignment scopes. Optional positive-integer query parameters: <code>after</code> (cursor), <code>limit</code> (default 50, maximum 100), <code>camper_id</code> (narrows results, never grants access).</dd>
+<dt><code>GET /records/{resource}/{id}</code></dt><dd>Read one accessible record.</dd>
+<dt><code>POST /records/{resource}</code></dt><dd>Create a record using the resource schema.</dd>
+<dt><code>PATCH /records/{resource}/{id}</code></dt><dd>Update permitted fields. Membership and ownership cannot be changed by editing a record.</dd>
+<dt><code>DELETE /records/{resource}/{id}</code></dt><dd>Delete only where explicitly permitted. Follow deployment retention policies.</dd>
+<dt><code>GET /menus?camper_id={id}</code></dt><dd>Meal view matched against the authorized camper's disclosed allergies/sensitivities. Without a camper ID the result is not assessed. Read the camper's special meals separately through <code>GET /records/special_meals?camper_id={id}</code>.</dd>
+<dt><code>GET /activities</code></dt><dd>Guest-visible activities/events, not internal schedules.</dd>
+<dt><code>POST /activities/{id}/signup</code></dt><dd>Enroll an authorized camper in an available activity. Body: <code>{"camper_id":42}</code>. The API checks ownership, duplicate signup, availability and capacity.</dd>
+</dl>
+<p>Record endpoints use a <code>data</code> envelope in responses. IDs are positive integers. Unsupported methods,
+unknown resources, unknown fields, and malformed JSON are rejected. Errors are JSON and do not echo submitted health data.</p>
+<p>Common statuses: <strong>400</strong> invalid request; <strong>401</strong> missing/invalid client credentials or session;
+<strong>403</strong> forbidden; <strong>404</strong> unknown or inaccessible record; <strong>405</strong> unsupported method;
+<strong>409</strong> conflicting state, full activity or duplicate signup; <strong>413</strong> body too large;
+<strong>415</strong> expected JSON content type; <strong>422</strong> invalid fields/query; <strong>429</strong> throttled; <strong>500/503</strong> service/configuration failure.
+Do not infer record existence from forbidden/not-found responses. Never show raw exceptions to end users.</p>
+</section>
+<section id="roles">
+<h2>Group and scope model</h2>
+<p>Membership is managed by trusted operators. There is no unrestricted “superuser” bypass.
+Administrative role assignment and credential recovery are intentionally CLI-controlled in this foundation; the portal cannot grant itself access.</p>
+<p>Executive readers can use <code>GET /records/audit_events</code> and <code>GET /records/configuration</code>
+for sanitized, read-only operational information. Configuration never returns secrets. Audits contain event metadata, not clinical content.</p>
+<p>Dietary staff use <code>GET /records/camper_names</code> (or <code>/{id}</code>) to cross-reference meals.
+This projection returns only camper ID and display name, not the broader camper record or clinical history.</p>
+<p>Guests discover grants through <code>GET /records/grant_opportunities</code> (or <code>/{id}</code>),
+which returns only <code>id</code>, <code>name</code> and optional <code>application_instructions</code>.
+The finance <code>grants</code> ledger remains inaccessible. Finance publishes opportunities by setting
+<code>application_status</code> to <code>available</code>; grants default to <code>internal</code> and can be
+<code>closed</code>. Use the catalog ID as <code>grant_id</code> in an application. Closed/internal grants
+cannot receive new guest applications, while authorized reviewers can finish existing applications after closure.</p>
+<ol>
+<li><strong>Executive Director:</strong> configuration/audit visibility and aggregate camper reporting; financial approvals, budgets/grants, and public/mission content. No raw clinical records.</li>
+<li><strong>Administrative Directors:</strong> administrative intake, consent/waivers, household demographics, rosters/cabins, policies, onboarding, templates and compliance reports. Trusted CLI handles account/role changes.</li>
+<li><strong>Medical &amp; Nursing Staff:</strong> medications, medication administration, health profiles/protocols, and clinical incidents; no public content, finance or role settings.</li>
+<li><strong>Behavioral Support Services:</strong> support plans, behavioral tracking and counselor strategies, plus separately curated behavior-relevant health context; not full clinical records.</li>
+<li><strong>Accessibility &amp; Adaptive Services:</strong> accommodations, adaptive equipment, facility audits and accessibility work requests.</li>
+<li><strong>Program Directors:</strong> master activities, adaptation guidance, participation, and separately curated safety alerts; no full clinical history.</li>
+<li><strong>Counselors &amp; DSP's:</strong> assigned campers' care profiles and daily logs; incident submission only. No global schedule, billing, or plan editing.</li>
+<li><strong>Facilities &amp; Cabin Maintenance:</strong> work orders, inspections and emergency alerts. No camper personal, clinical or behavioral records.</li>
+<li><strong>Housekeeping:</strong> sanitation rosters, sensory-room setup and supply requests; no camper records.</li>
+<li><strong>Catering &amp; Dietary Support:</strong> dietary restrictions, menu planning and special meals; no general health or behavioral records.</li>
+<li><strong>Finance &amp; Accounting:</strong> billing, payroll, grant funds and financial reporting; no clinical or behavioral records.</li>
+<li><strong>Guest:</strong> own reservations, accommodations, prescription disclosures, allergies, grant applications and activity signups; read guest-facing menus/events, own balances and own special meals only.</li>
+</ol>
+<p>“Read only” does not imply unrestricted access. A counselor's reads are assignment-scoped; a guest's reads and writes are owner-scoped.
+Users with several groups receive the union of their explicitly granted capabilities. Assign only necessary groups and regularly review combinations.</p>
+</section>
+<section id="records">
+<h2>Working with records</h2>
+<p>Fetch <code>GET /resources</code> first. It is the authoritative list of resource names, fields and operations
+for the caller. Do not guess resource names or place arbitrary JSON into records. Separate clinical,
+behavioral, safety, care and dietary resources prevent broad records from being returned to roles needing only a subset.</p>
+<pre>GET /api/v1/resources
+GET /api/v1/records/reservations
+GET /api/v1/records/reservations/42</pre>
+<p>Before creating or updating, use the exact field schema advertised by the API. An owner or camper link is an authorization boundary,
+not a client-trusted assertion. Guests cannot select another owner; counselors cannot select an unassigned camper.
+Only trusted operators manage counselor assignments and memberships.</p>
+<h3>Example: a guest reservation</h3>
+<p>Use a camper ID already linked to this guest by a trusted operator. Send fields directly in the JSON object, not inside a <code>data</code> wrapper:</p>
+<pre>POST /api/v1/records/reservations
+Content-Type: application/json
+
+{
+  "camper_id": 42,
+  "arrival_date": "2027-06-07",
+  "departure_date": "2027-06-14",
+  "status": "requested"
+}</pre>
+<p>A successful create returns HTTP 201 with a <code>data</code> record containing its ID and fields.
+To cancel, <code>PATCH /records/reservations/{id}</code> with <code>{"status":"cancelled"}</code>.
+Guests cannot confirm their own booking or approve their own grant application.</p>
+<p>Lists return <code>{"data":[...],"next_after":null}</code>. If <code>next_after</code> is an ID,
+request the next page using <code>?after={id}&amp;limit=50</code>. Preserve any camper filter.
+Single-record responses return <code>{"data":{...}}</code>. Timestamps are UTC.
+Record requests are limited to 64 KiB, with smaller field-specific limits in the resource schema.</p>
+<p>Activity signup automatically creates a participation record for Program Directors. To cancel an enrollment,
+PATCH its <code>activity_signups</code> record with <code>{"status":"cancelled"}</code>.
+Recorded attendance cannot be erased through cancellation. Trusted operators preload restricted housekeeping/facility task rosters
+with the CLI's <code>seed-task</code> command; read/update-only teams cannot manufacture their own tasks.</p>
+<p>Clinical staff must curate minimum-necessary safety/behavior/care extracts. The API does not automatically convert a full
+medical history into a safe summary. Do not copy PHI into public content, menus, schedules, maintenance work orders,
+housekeeping instructions or financial descriptions. The system cannot detect all inappropriate free-text disclosure.</p>
+<p>For meals, use a consistent vocabulary for allergen and sensitivity tags. Matching is a presentation aid, not a guarantee:
+unknown ingredients, cross-contact, texture requirements, medication interactions and late dietary changes require staff review.
+The portal strikes through flagged meals and shows the guest's special meal. Do not serve a meal based solely on automated matching.</p>
+<p>Reservation balances and billing records are bookkeeping only. Actual payments/refunds must use a compliant external payment
+processor with tokenized references; never submit card numbers, CVVs, bank credentials or insurance identifiers in free text.
+Guests can read their own <code>billing</code> records but cannot mark them paid or change amounts.
+Grant applications are distinct from finance allocation/approval records. A guest's own grant application does not grant access to finance reports.</p>
+</section>
+<section id="examples">
+<h2>Client examples</h2>
+<p>Each example signs in and fetches groups through <code>/auth/me</code>. Replace the base URL with your own TLS endpoint.
+Credentials come from secure runtime configuration, not source code. Examples intentionally do not print passwords, tokens or PHI.
+Handle production network errors, cancellation, reauthentication and HTTP 429 with bounded backoff.</p>
+<h3>JavaScript (trusted Node.js server, built-in fetch)</h3>
+<pre>const base = process.env.CAMP_API_BASE;
+if (new URL(base).protocol !== "https:") throw new Error("HTTPS required");
+const headers = {
+  "Content-Type": "application/json",
+  "X-API-Token": process.env.CAMP_API_TOKEN,
+  "X-API-Secret": process.env.CAMP_API_SECRET
+};
+async function request(path, options = {}) {
+  const response = await fetch(base + path, {
+    ...options, headers: { ...headers, ...options.headers },
+    redirect: "error", signal: AbortSignal.timeout(15000)
+  });
+  if (!response.ok) throw new Error(`API status ${response.status}`);
+  return response.json();
+}
+const session = await request("/auth/login", {
+  method: "POST",
+  body: JSON.stringify({ email: process.env.CAMP_EMAIL,
+                         password: process.env.CAMP_PASSWORD })
+});
+const me = await request("/auth/me", {
+  headers: { Authorization: ["Bearer", session.access_token].join(" ") }
+});
+// Use me.groups in your authorized application view; do not log me.
+</pre>
+<h3>PHP (server-side cURL)</h3>
+<pre>&lt;?php
+function request(string $path, ?array $body = null, ?string $bearer = null): array {
+    $headers = ['Content-Type: application/json',
+        'X-API-Token: ' . getenv('CAMP_API_TOKEN'),
+        'X-API-Secret: ' . getenv('CAMP_API_SECRET')];
+    if ($bearer !== null) $headers[] = 'Authorization: Bearer ' . $bearer;
+    $ch = curl_init(getenv('CAMP_API_BASE') . $path);
+    curl_setopt_array($ch, [
+        CURLOPT_HTTPHEADER =&gt; $headers, CURLOPT_RETURNTRANSFER =&gt; true,
+        CURLOPT_TIMEOUT =&gt; 15, CURLOPT_FOLLOWLOCATION =&gt; false,
+        CURLOPT_PROTOCOLS =&gt; CURLPROTO_HTTPS
+    ]);
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_THROW_ON_ERROR));
+    }
+    $raw = curl_exec($ch);
+    $status = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($raw === false || $status &lt; 200 || $status &gt;= 300) {
+        throw new RuntimeException('API request failed');
+    }
+    return json_decode($raw, true, 64, JSON_THROW_ON_ERROR);
+}
+$session = request('/auth/login', [
+    'email' =&gt; getenv('CAMP_EMAIL'), 'password' =&gt; getenv('CAMP_PASSWORD')
+]);
+$me = request('/auth/me', null, $session['access_token']);
+</pre>
+<h3>Python (standard library)</h3>
+<pre>import json
+import os
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = build_opener(NoRedirect)
+base = os.environ["CAMP_API_BASE"]
+if not base.startswith("https://"):
+    raise ValueError("HTTPS required")
+
+def request(path, body=None, bearer=None):
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-Token": os.environ["CAMP_API_TOKEN"],
+        "X-API-Secret": os.environ["CAMP_API_SECRET"],
+    }
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
+    payload = None if body is None else json.dumps(body).encode()
+    req = Request(base + path, data=payload, headers=headers,
+                  method="GET" if body is None else "POST")
+    with opener.open(req, timeout=15) as response:
+        return json.load(response)
+
+session = request("/auth/login", {
+    "email": os.environ["CAMP_EMAIL"],
+    "password": os.environ["CAMP_PASSWORD"],
+})
+me = request("/auth/me", bearer=session["access_token"])
+</pre>
+<h3>Java (Android, platform APIs)</h3>
+<p>Run off the main/UI thread. Add the Android <code>INTERNET</code> permission. Do not enable cleartext traffic.
+The parameters below must come from your secure gateway/session provisioning flow; do not hardcode a shared application secret.</p>
+<pre>import org.json.JSONObject;
+import javax.net.ssl.HttpsURLConnection;
+import java.net.URL;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+
+static JSONObject request(String base, String path, String clientToken,
+        String clientSecret, JSONObject body, String bearer) throws Exception {
+    HttpsURLConnection c = (HttpsURLConnection) new URL(base + path).openConnection();
+    c.setInstanceFollowRedirects(false);
+    c.setConnectTimeout(15000);
+    c.setReadTimeout(15000);
+    c.setRequestMethod(body == null ? "GET" : "POST");
+    c.setRequestProperty("Content-Type", "application/json");
+    c.setRequestProperty("X-API-Token", clientToken);
+    c.setRequestProperty("X-API-Secret", clientSecret);
+    if (bearer != null) c.setRequestProperty("Authorization", "Bearer " + bearer);
+    try {
+        if (body != null) {
+            c.setDoOutput(true);
+            try (java.io.OutputStream out = c.getOutputStream()) {
+                out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        if (c.getResponseCode() &lt; 200 || c.getResponseCode() &gt;= 300)
+            throw new java.io.IOException("API request rejected");
+        try (InputStream in = c.getInputStream();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int n;
+            while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+            return new JSONObject(new String(out.toByteArray(), StandardCharsets.UTF_8));
+        }
+    } finally { c.disconnect(); }
+}
+
+// Inside your background executor, with securely supplied variables:
+JSONObject credentials = new JSONObject().put("email", email).put("password", password);
+JSONObject session = request(base, "/auth/login", clientToken, clientSecret, credentials, null);
+JSONObject me = request(base, "/auth/me", clientToken, clientSecret, null,
+                        session.getString("access_token"));
+</pre>
+<h3>Swift (iOS, URLSession async/await)</h3>
+<p>Use a gateway for production client credentials. Retain a user session in Keychain only when persistence is needed.
+Keep App Transport Security enabled. This example uses an ephemeral session and rejects redirects.</p>
+<pre>import Foundation
+
+final class NoRedirect: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -&gt; Void) {
+        completionHandler(nil)
+    }
+}
+
+struct Login: Decodable { let access_token: String; let expires_in: Int }
+struct Group: Decodable { let id: Int; let name: String }
+struct Me: Decodable { let groups: [Group] }
+
+func request&lt;T: Decodable&gt;(_ type: T.Type, base: URL, path: String,
+    clientToken: String, clientSecret: String,
+    body: [String: String]? = nil, bearer: String? = nil) async throws -&gt; T {
+    guard base.scheme == "https",
+          let url = URL(string: base.absoluteString + path) else {
+        throw URLError(.badURL)
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 15
+    req.httpMethod = body == nil ? "GET" : "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue(clientToken, forHTTPHeaderField: "X-API-Token")
+    req.setValue(clientSecret, forHTTPHeaderField: "X-API-Secret")
+    if let bearer { req.setValue(["Bearer", bearer].joined(separator: " "), forHTTPHeaderField: "Authorization") }
+    if let body { req.httpBody = try JSONSerialization.data(withJSONObject: body) }
+    let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(),
+                             delegateQueue: nil)
+    defer { session.invalidateAndCancel() }
+    let (data, response) = try await session.data(for: req)
+    guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode)
+        else { throw URLError(.badServerResponse) }
+    return try JSONDecoder().decode(type, from: data)
+}
+
+// From an async function with securely supplied parameters:
+let login = try await request(Login.self, base: base, path: "/auth/login",
+    clientToken: clientToken, clientSecret: clientSecret,
+    body: ["email": email, "password": password])
+let me = try await request(Me.self, base: base, path: "/auth/me",
+    clientToken: clientToken, clientSecret: clientSecret, bearer: login.access_token)
+</pre>
+</section>
+<section id="security">
+<h2>Deployment and HIPAA safeguards</h2>
+<ul>
+<li>Terminate TLS at a hardened web server. Forward the verified HTTPS state to PHP through trusted server configuration;
+never trust arbitrary client-supplied forwarding headers. Do not deploy the development HTTP bypass.</li>
+<li>Expose only the API front controller, portal assets, and static developer page. Block direct access to source modules,
+SQL, CLI tools, tests, environment files, dotfiles and repository metadata. The PHP development server is not a production web server.</li>
+<li>Set secrets through a secret manager or protected process environment outside the document root.
+Use an independent application-encryption key and back it up securely. Losing it makes encrypted records unreadable.
+Rotation requires a planned decrypt/re-encrypt migration; do not simply replace it.</li>
+<li>Use a least-privilege runtime MySQL account, a separate migration identity, encrypted DB transport when remote,
+encrypted disks/backups, tested restore procedures, and restricted network access. Set <code>DB_SSL_CA</code> to the trusted
+CA certificate for remote production MySQL. Application encryption does not protect all metadata, including account identities and ownership links.</li>
+<li>Implement MFA and an approved identity lifecycle before production PHI access. Review privileged memberships,
+disable departed users, revoke compromised clients/sessions and rotate secrets through controlled operations.</li>
+<li>Protect audit storage against runtime alteration using restricted grants and remote immutable retention.
+Monitor denied access, abnormal reads, login failures, exports, and privileged CLI changes.
+Audit metadata is still sensitive; do not log request/response bodies, passwords, headers or session tokens.</li>
+<li>Configure web/proxy access logs to omit query strings and record identifiers, or protect them as sensitive metadata with
+restricted access and an approved retention policy. REST paths can reveal that a user accessed a health-related resource.</li>
+<li>Set retention, legal-hold, backup and deletion policies before enabling destructive operations.
+Use minimum-necessary data, verified guardian relationships and explicit policies for camper access.</li>
+<li>Obtain applicable business associate agreements, perform a documented risk assessment, train staff,
+maintain incident response/breach notification procedures, and conduct penetration testing and access reviews.</li>
+<li>Use endpoint device controls and automatic screen locks. The portal has a 15-minute idle timeout;
+also configure server-side PHP session garbage collection and restrictive session storage permissions.</li>
+</ul>
+<p>No permissive CORS is supplied. Browser applications should use a same-origin trusted backend such as this portal.
+Any future CORS, reverse proxy, payment, file upload, export, clinical signing or role-management feature needs its own threat review.</p>
+</section>
+</main>
+<footer>Camp Cody's · API v1 developer reference</footer>
+</body>
+</html>
