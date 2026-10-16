@@ -5,6 +5,7 @@ namespace Camp;
 
 final class App
 {
+    use RegistrationAuth;
     private ?array $user = null;
     private ?array $client = null;
     private array $roles = [];
@@ -40,6 +41,20 @@ final class App
             $path = substr($path, 7);
             if ($path === '/auth/login' && $method === 'POST') {
                 $this->respond($this->login());
+            }
+            if ($method === 'POST') {
+                $result = match ($path) {
+                    '/auth/register' => $this->register(),
+                    '/auth/activate' => $this->activate(),
+                    '/auth/profile' => $this->saveProfile(),
+                    '/auth/mfa/setup' => $this->setupMfa(),
+                    '/auth/mfa/confirm' => $this->confirmMfa(),
+                    '/auth/mfa/verify' => $this->verifyMfa(),
+                    default => null,
+                };
+                if ($result !== null) {
+                    $this->respond($result);
+                }
             }
             $this->authenticateUser();
             if ($path === '/auth/me' && $method === 'GET') {
@@ -147,7 +162,9 @@ final class App
         }
         $email = strtolower(trim($body['email']));
         $this->rate('account:' . hash_hmac('sha256', $email, $this->config['key']), 15, 900);
-        $user = $this->execute('SELECT * FROM users WHERE email = ? AND active = 1', [$email])->fetch();
+        $user = str_contains($email, '@')
+            ? $this->execute('SELECT * FROM users WHERE email = ? AND active = 1', [$email])->fetch()
+            : $this->execute("SELECT u.* FROM users u JOIN account_onboarding a ON a.user_id = u.id WHERE a.username = ? AND a.stage = 'complete' AND u.active = 1", [$email])->fetch();
         // A dummy Argon2id hash avoids skipping expensive verification for unknown accounts.
         $hash = $user['password_hash'] ?? '$argon2id$v=19$m=65536,t=4,p=1$WHpILnZCR0ppN1VoNGx4Lw$7FwzUCFZ5W/iqRyTrDay4jVmEcP/JCqrKdUBL0Gqh3g';
         $ambiguousLegacyPassword = password_get_info($hash)['algoName'] === 'bcrypt' && strlen($body['password']) > 72;
@@ -156,26 +173,33 @@ final class App
         }
         $this->db->beginTransaction();
         $locked = $this->execute('SELECT * FROM users WHERE id = ? FOR UPDATE', [$user['id']])->fetch();
-        if (!$locked || (int) $locked['active'] !== 1 || $locked['email'] !== $email
+        if (!$locked || (int) $locked['active'] !== 1 || $locked['email'] !== $user['email']
             || !hash_equals($hash, $locked['password_hash'])) {
             $this->rejectLogin();
         }
         $user = $this->user = $locked;
-        $token = bin2hex(random_bytes(32));
-        $this->execute('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE user_id = ? AND expires_at <= UTC_TIMESTAMP() AND revoked_at IS NULL', [$user['id']]);
-        $active = $this->execute('SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL ORDER BY id DESC', [$user['id']])->fetchAll();
-        foreach (array_slice($active, 9) as $session) {
-            $this->execute('UPDATE sessions SET revoked_at = UTC_TIMESTAMP() WHERE id = ?', [$session['id']]);
-        }
-        $this->execute('INSERT INTO sessions (user_id, client_id, token_hash, expires_at) VALUES (?, ?, ?, ?)', [
-            $user['id'], $this->client['id'], hash('sha256', $token), gmdate('Y-m-d H:i:s', time() + 3600),
-        ]);
         if (password_needs_rehash($hash, PASSWORD_ARGON2ID)) {
-            $this->execute('UPDATE users SET password_hash = ? WHERE id = ?', [password_hash($body['password'], PASSWORD_ARGON2ID), $user['id']]);
+            $hash = password_hash($body['password'], PASSWORD_ARGON2ID);
+            $this->execute('UPDATE users SET password_hash = ? WHERE id = ?', [$hash, $user['id']]);
         }
+        $account = $this->execute('SELECT stage FROM account_onboarding WHERE user_id = ? FOR UPDATE', [$user['id']])->fetch();
+        if ($account) {
+            if ($account['stage'] !== 'complete') {
+                $this->rejectLogin();
+            }
+            $token = bin2hex(random_bytes(32));
+            $this->execute('DELETE FROM mfa_challenges WHERE user_id = ? AND expires_at <= UTC_TIMESTAMP()', [$user['id']]);
+            $this->execute('INSERT INTO mfa_challenges (token_hash, user_id, client_id, password_version, expires_at) VALUES (?, ?, ?, ?, ?)', [
+                hash('sha256', $token), $user['id'], $this->client['id'], hash('sha256', $hash), gmdate('Y-m-d H:i:s', time() + 300),
+            ]);
+            $this->audit('auth.mfa.challenge');
+            $this->db->commit();
+            return ['mfa_token' => $token];
+        }
+        $result = $this->issueSession();
         $this->audit('auth.login');
         $this->db->commit();
-        return ['access_token' => $token, 'expires_in' => 3600];
+        return $result;
     }
 
     private function rejectLogin(): never
@@ -703,13 +727,13 @@ final class App
         return $result;
     }
 
-    private function body(): array
+    private function body(int $maxBytes = 65536): array
     {
         if (strtolower(trim(explode(';', $_SERVER['CONTENT_TYPE'] ?? '')[0])) !== 'application/json') {
             throw new ApiError(415, 'application/json is required');
         }
-        $raw = file_get_contents('php://input', false, null, 0, 65537);
-        if ($raw === false || strlen($raw) > 65536) {
+        $raw = file_get_contents('php://input', false, null, 0, $maxBytes + 1);
+        if ($raw === false || strlen($raw) > $maxBytes) {
             throw new ApiError(413, 'Request body too large');
         }
         try {
