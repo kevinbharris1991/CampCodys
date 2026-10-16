@@ -1,6 +1,6 @@
 Options -Indexes
 RewriteEngine On
-RewriteRule ^(?:bootstrap|catalog|App)\.php$ - [F,L]
+RewriteRule ^(?:bootstrap|catalog|App|Auth)\.php$ - [F,L]
 RewriteRule ^schema\.sql$ - [F,L]
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteRule ^ index.php [END,QSA]

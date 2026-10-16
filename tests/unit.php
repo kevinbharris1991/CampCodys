@@ -35,6 +35,20 @@ function invalidConfig(string $name): void
 }
 
 $key = random_bytes(SODIUM_CRYPTO_SECRETBOX_KEYBYTES);
+// RFC 4226/6238 SHA-1 reference secret and counters (six-digit truncation).
+$totpSecret = \Camp\base32Encode('12345678901234567890');
+check($totpSecret === 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 'RFC base32 encoding');
+foreach ([0 => '755224', 1 => '287082', 2 => '359152', 3 => '969429', 4 => '338314', 5 => '254676'] as $step => $code) {
+    check(\Camp\totpCode($totpSecret, $step) === $code, 'RFC HOTP counter ' . $step);
+}
+check(\Camp\totpCode($totpSecret, 1) === '287082', 'RFC 6238 time 59 truncated to six digits');
+check(\Camp\totpStep($totpSecret, '287082', -1, 59) === 1, 'TOTP current window');
+check(\Camp\totpStep($totpSecret, '755224', -1, 59) === 0, 'TOTP previous window');
+check(\Camp\totpStep($totpSecret, '359152', -1, 59) === 2, 'TOTP next window');
+check(\Camp\totpStep($totpSecret, '287082', 1, 59) === null, 'TOTP replay rejected');
+check(\Camp\totpStep($totpSecret, '755224', 1, 59) === null, 'TOTP older step rejected');
+check(\Camp\totpStep($totpSecret, '969429', -1, 59) === null, 'TOTP outside window rejected');
+check(\Camp\totpStep($totpSecret, '12345', -1, 59) === null, 'TOTP exactly six digits');
 $payload = ['medication' => 'Private example', 'instructions' => 'Sensitive example'];
 $encrypted = \Camp\encryptPayload($payload, $key);
 check(!str_contains($encrypted, 'Private'), 'ciphertext does not contain plaintext');
@@ -166,6 +180,8 @@ foreach (['APP_ENV', 'APP_REQUIRE_TLS', 'DB_DSN', 'DB_USER', 'DB_PASSWORD', 'APP
     putenv($name);
 }
 putenv('DB_SSL_CA');
+putenv('APP_PUBLIC_URL');
+putenv('APP_MAIL_FROM');
 invalidConfig('missing config fails closed');
 putenv('APP_ENV=production');
 putenv('APP_REQUIRE_TLS=false');
@@ -176,6 +192,21 @@ putenv('APP_ENCRYPTION_KEY=' . base64_encode($key));
 invalidConfig('production cannot disable TLS');
 putenv('APP_REQUIRE_TLS=true');
 check(\Camp\config(__DIR__)['key'] === $key, 'valid config');
+putenv('APP_PUBLIC_URL=https://camp.example.test/public/');
+putenv('APP_MAIL_FROM=accounts@example.test');
+check(\Camp\config(__DIR__)['APP_MAIL_FROM'] === 'accounts@example.test', 'registration config from process environment');
+foreach ([
+    'http://camp.example.test/public/', '//camp.example.test/public/', 'https://camp.example.test/public',
+    'https://camp.example.test/public/?evil=1', 'https://camp.example.test/public/#evil',
+    'https://user@camp.example.test/public/', 'https://camp.example.test/other/',
+] as $url) {
+    putenv('APP_PUBLIC_URL=' . $url);
+    invalidConfig('unsafe registration origin rejected');
+}
+putenv('APP_PUBLIC_URL=https://camp.example.test/public/');
+putenv("APP_MAIL_FROM=accounts@example.test\r\nBcc:bad@example.test");
+invalidConfig('mail header injection rejected');
+putenv('APP_MAIL_FROM=accounts@example.test');
 putenv('DB_DSN=mysql:host=database.example.test;dbname=example;charset=utf8mb4');
 invalidConfig('production remote database requires verified TLS');
 putenv('DB_DSN=mysql:host=localhost;host=database.example.test;dbname=example;charset=utf8mb4');

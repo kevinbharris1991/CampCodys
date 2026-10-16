@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Camp;
 
 require_once __DIR__ . '/catalog.php';
+require_once __DIR__ . '/Auth.php';
 
 final class ApiError extends \RuntimeException
 {
@@ -42,6 +43,13 @@ function config(?string $root = null): array
             throw new \RuntimeException('Missing configuration');
         }
     }
+    foreach (['APP_PUBLIC_URL', 'APP_MAIL_FROM'] as $name) {
+        $value = getenv($name);
+        if ($value !== false) {
+            $values[$name] = $value;
+        }
+        $values[$name] ??= '';
+    }
     $key = base64_decode($values['APP_ENCRYPTION_KEY'], true);
     if ($key === false || strlen($key) !== SODIUM_CRYPTO_SECRETBOX_KEYBYTES
         || count(array_unique(str_split($key))) < 8
@@ -59,6 +67,19 @@ function config(?string $root = null): array
         throw new \RuntimeException('Verified database TLS required');
     }
     $values['key'] = $key;
+    if ($values['APP_PUBLIC_URL'] !== '' || $values['APP_MAIL_FROM'] !== '') {
+        $url = parse_url($values['APP_PUBLIC_URL']);
+        if (!$url || !filter_var($values['APP_PUBLIC_URL'], FILTER_VALIDATE_URL)
+            || !isset($url['host'], $url['scheme']) || isset($url['user']) || isset($url['pass'])
+            || isset($url['query']) || isset($url['fragment']) || ($url['path'] ?? '') !== '/public/'
+            || preg_match('/[\x00-\x20\x7f]/', $values['APP_PUBLIC_URL'])
+            || !in_array($url['scheme'], ['https', 'http'], true)
+            || ($values['APP_ENV'] === 'production' && $url['scheme'] !== 'https')
+            || !filter_var($values['APP_MAIL_FROM'], FILTER_VALIDATE_EMAIL)
+            || preg_match('/[\r\n]/', $values['APP_MAIL_FROM'])) {
+            throw new \RuntimeException('Unsafe registration configuration');
+        }
+    }
     return $values;
 }
 

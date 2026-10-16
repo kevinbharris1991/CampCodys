@@ -9,6 +9,7 @@ main { max-width: 60rem; margin: auto; padding: 1rem; }
 section { background: white; padding: 1.5rem; margin-block: 1.5rem; border: 1px solid #bdcec5; border-radius: .75rem; }
 a { color: #155849; }
 label { display: block; font-weight: 600; margin-block: 1rem; }
+.consent input { display: inline-block; width: auto; margin-right: .5rem; }
 input, select, textarea { display: block; width: 100%; max-width: 42rem; margin-top: .3rem; padding: .7rem; border: 1px solid #657e71; border-radius: .3rem; font: inherit; color: #17312d; background: white; }
 textarea, pre { font-family: ui-monospace, monospace; }
 button { background: #164d43; color: white; padding: .8rem 1.2rem; border: 2px solid transparent; border-radius: .3rem; cursor: pointer; font: inherit; font-weight: 600; }

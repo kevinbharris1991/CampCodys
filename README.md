@@ -44,6 +44,26 @@ PORTAL_API_SECRET=<provisioned API client secret>
 APP_ENV=production
 ```
 
+For self-registration, configure `APP_PUBLIC_URL` with the trusted HTTPS portal
+URL (for example `https://your-camp-host/public/`) and `APP_MAIL_FROM` with your
+sender email address in the API environment. Configure PHP's `mail()` transport
+to deliver activation emails; never derive activation links from request headers.
+Set `PORTAL_TERMS_URL` and `PORTAL_PRIVACY_URL` in the portal process environment
+to your published HTTPS terms of service and privacy policy. Registration stays
+unavailable until these policies are configured.
+
+New guests must be 13 or older and register their name, date of birth, email and gender, accepting both
+policies before submitting. The activation email opens profile setup, with an
+optional JPEG/PNG picture (256 KiB maximum), a unique username and a confirmed
+password (12–1024 bytes). A verified authenticator-app code is required to finish
+MFA setup before opening the dashboard. Subsequent guest sign-ins require a
+password and authenticator code. Operator-provisioned accounts retain their
+existing sign-in behavior.
+
+After updating an existing installation, run `php bin/console.php setup` using
+the schema administrator to create the additive onboarding tables, and grant
+the runtime identity the required data privileges on those tables.
+
 ## Initialize and provision
 
 Run these commands from your checkout after configuring the environment. Create
@@ -183,15 +203,17 @@ The administrative DSN must not contain `dbname`.
 
 ## Operational boundaries
 
-- Provision users, client credentials, memberships and camper assignments using
-  the trusted CLI, not public self-registration. Verify guardian relationships
-  before linking a guest to a camper.
+- Public self-registration grants only Guest access after email activation,
+  profile setup and MFA confirmation. Provision staff, client credentials,
+  memberships and camper assignments using the trusted CLI. Verify guardian
+  relationships before linking a guest to a camper; registration creates no
+  camper relationships.
 - Give the runtime database identity only required data privileges. Use a
   separate identity for schema setup and protect audit events with append-only
   database grants and external immutable storage. Grant per table: MySQL
   privileges are additive, so a database-wide UPDATE/DELETE grant cannot be
   negated by withholding those privileges on `audit_events`.
-- Record payloads are encrypted, but account email/display names, record
+- Record and onboarding profile payloads are encrypted, but account email/display names, record
   ownership links, timestamps and audit metadata remain database metadata.
   Protect the entire database and its backups, not just the encrypted columns.
 - Resource schemas and effective permissions are discoverable through

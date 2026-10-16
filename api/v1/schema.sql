@@ -105,3 +105,42 @@ CREATE TABLE IF NOT EXISTS audit_events (
     INDEX (occurred_at),
     INDEX (actor_id, occurred_at)
 ) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS account_onboarding (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(254) NOT NULL UNIQUE,
+    username VARCHAR(40) NULL UNIQUE,
+    user_id BIGINT UNSIGNED NULL UNIQUE,
+    client_id BIGINT UNSIGNED NULL,
+    stage VARCHAR(16) NOT NULL DEFAULT 'pending',
+    profile MEDIUMTEXT NOT NULL,
+    password_hash VARCHAR(255) NULL,
+    activation_hash CHAR(64) NULL UNIQUE,
+    onboarding_hash CHAR(64) NULL UNIQUE,
+    expires_at DATETIME NOT NULL,
+    terms_accepted_at DATETIME NOT NULL,
+    privacy_accepted_at DATETIME NOT NULL,
+    last_totp_step BIGINT NOT NULL DEFAULT -1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX (stage, expires_at),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (client_id) REFERENCES api_clients(id)
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS mfa_challenges (
+    token_hash CHAR(64) PRIMARY KEY,
+    user_id BIGINT UNSIGNED NOT NULL,
+    client_id BIGINT UNSIGNED NOT NULL,
+    password_version CHAR(64) NOT NULL,
+    expires_at DATETIME NOT NULL,
+    INDEX (expires_at),
+    INDEX (user_id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (client_id) REFERENCES api_clients(id)
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS onboarding_activation_tokens (
+    token_hash CHAR(64) PRIMARY KEY,
+    account_id BIGINT UNSIGNED NOT NULL,
+    expires_at DATETIME NOT NULL,
+    INDEX (account_id),
+    INDEX (expires_at),
+    FOREIGN KEY (account_id) REFERENCES account_onboarding(id) ON DELETE CASCADE
+) ENGINE=InnoDB;

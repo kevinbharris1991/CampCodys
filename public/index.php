@@ -78,14 +78,69 @@ function api(string $method, string $path, ?array $body = null): array
     }
     if ($status === 401) {
         unset($_SESSION['access_token']);
+        $failure = json_decode($response, true);
+        if (str_starts_with($path, '/auth/') && is_string($failure['error'] ?? null)) {
+            throw new RuntimeException($failure['error'], $status);
+        }
         throw new RuntimeException('Sign in again. Your session or API credentials were not accepted.');
     }
     if ($status >= 400) {
+        $failure = json_decode($response, true);
+        if (in_array($status, [409, 413, 422, 429], true) && is_string($failure['error'] ?? null)) {
+            throw new RuntimeException($failure['error'], $status);
+        }
         throw new RuntimeException('API request rejected (HTTP ' . $status . '). Check your permissions and the API documentation.');
     }
     return $response === '' ? [] : json_decode($response, true, 64, JSON_THROW_ON_ERROR);
 }
 
+function policyUrl(string $setting): string
+{
+    $value = getenv($setting) ?: '';
+    $url = parse_url($value);
+    $local = getenv('APP_ENV') === 'development'
+        && in_array($url['host'] ?? '', ['127.0.0.1', 'localhost', '[::1]'], true);
+    return $url && !isset($url['user']) && !isset($url['pass']) && isset($url['host'])
+        && !preg_match('/[\x00-\x20]/', $value)
+        && (($url['scheme'] ?? '') === 'https' || (($url['scheme'] ?? '') === 'http' && $local))
+        ? $value : '';
+}
+
+function signedIn(array $login): void
+{
+    if (!is_string($login['access_token'] ?? null)) {
+        throw new RuntimeException('Unexpected sign-in response.');
+    }
+    $_SESSION = ['access_token' => $login['access_token'], 'csrf' => bin2hex(random_bytes(32)), 'last_seen' => time()];
+    session_regenerate_id(true);
+    header('Location: /public/');
+    exit;
+}
+
+$termsUrl = policyUrl('PORTAL_TERMS_URL');
+$privacyUrl = policyUrl('PORTAL_PRIVACY_URL');
+$today = new DateTimeImmutable('today', new DateTimeZone('UTC'));
+$birthDateLimit = $today->modify('-13 years');
+if ($birthDateLimit->format('m-d') !== $today->format('m-d')) {
+    $birthDateLimit = $birthDateLimit->modify('-1 day');
+}
+$page = is_string($_GET['page'] ?? null) ? $_GET['page'] : '';
+if (isset($_GET['activate']) && !isset($_SESSION['access_token'])) {
+    if (!is_string($_GET['activate']) || !preg_match('/\A[a-f0-9]{64}\z/D', $_GET['activate'])) {
+        http_response_code(400);
+        exit('Invalid activation link.');
+    }
+    $_SESSION = ['activation_token' => $_GET['activate'], 'csrf' => bin2hex(random_bytes(32)), 'last_seen' => time()];
+    session_regenerate_id(true);
+    header('Location: /public/?page=profile');
+    exit;
+}
+$notice = $_SESSION['notice'] ?? '';
+unset($_SESSION['notice']);
+if (!isset($_SESSION['access_token']) && isset($_SESSION['mfa_setup']) && $page === 'profile') {
+    header('Location: /public/?page=mfa');
+    exit;
+}
 $error = '';
 $result = null;
 $me = null;
@@ -103,17 +158,96 @@ try {
             throw new RuntimeException('Invalid form token. Reload the page.');
         }
         $action = $_POST['action'] ?? '';
-        if ($action === 'login') {
+        if ($action === 'register') {
+            $page = 'register';
+            if ($termsUrl === '' || $privacyUrl === '') {
+                throw new RuntimeException('Registration is unavailable until the terms and privacy policy are configured.');
+            }
+            api('POST', '/auth/register', [
+                'name' => (string) ($_POST['name'] ?? ''),
+                'date_of_birth' => (string) ($_POST['date_of_birth'] ?? ''),
+                'email' => (string) ($_POST['email'] ?? ''),
+                'gender' => (string) ($_POST['gender'] ?? ''),
+                'terms_accepted' => ($_POST['terms_accepted'] ?? '') === '1',
+                'privacy_accepted' => ($_POST['privacy_accepted'] ?? '') === '1',
+            ]);
+            $_SESSION['notice'] = 'Check your email for an activation link. If this address is eligible, an email will arrive shortly.';
+            header('Location: /public/?page=check-email');
+            exit;
+        } elseif ($action === 'profile') {
+            $page = 'profile';
+            if (!isset($_SESSION['activation_token']) && !isset($_SESSION['onboarding_token'])) {
+                throw new RuntimeException('Open your email activation link first.');
+            }
+            $body = [
+                'username' => (string) ($_POST['username'] ?? ''),
+                'password' => (string) ($_POST['password'] ?? ''),
+                'password_confirmation' => (string) ($_POST['password_confirmation'] ?? ''),
+            ];
+            $photo = $_FILES['profile_picture'] ?? null;
+            if ($photo !== null && ($photo['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE) {
+                if ($photo['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($photo['tmp_name'])
+                    || filesize($photo['tmp_name']) > 262144) {
+                    throw new RuntimeException('Upload a JPEG or PNG picture no larger than 256 KiB.');
+                }
+                $bytes = file_get_contents($photo['tmp_name']);
+                if ($bytes === false) {
+                    throw new RuntimeException('Could not read your picture.');
+                }
+                $body['profile_picture'] = base64_encode($bytes);
+            }
+            if (isset($_SESSION['activation_token'])) {
+                $activation = api('POST', '/auth/activate', ['token' => $_SESSION['activation_token']]);
+                if (!is_string($activation['onboarding_token'] ?? null)) {
+                    throw new RuntimeException('Unexpected activation response.');
+                }
+                $_SESSION['onboarding_token'] = $activation['onboarding_token'];
+                unset($_SESSION['activation_token']);
+                session_regenerate_id(true);
+                if (($activation['next_step'] ?? '') === 'mfa') {
+                    $_SESSION['mfa_setup'] = api('POST', '/auth/mfa/setup', ['onboarding_token' => $_SESSION['onboarding_token']]);
+                    header('Location: /public/?page=mfa');
+                    exit;
+                }
+            }
+            try {
+                $setup = api('POST', '/auth/profile', ['onboarding_token' => $_SESSION['onboarding_token']] + $body);
+            } catch (RuntimeException $exception) {
+                if ($exception->getCode() !== 409) {
+                    throw $exception;
+                }
+                try {
+                    $setup = api('POST', '/auth/mfa/setup', ['onboarding_token' => $_SESSION['onboarding_token']]);
+                } catch (RuntimeException) {
+                    throw $exception;
+                }
+            }
+            $_SESSION['mfa_setup'] = $setup;
+            header('Location: /public/?page=mfa');
+            exit;
+        } elseif ($action === 'confirm_mfa' && isset($_SESSION['onboarding_token'], $_SESSION['mfa_setup'])) {
+            $page = 'mfa';
+            signedIn(api('POST', '/auth/mfa/confirm', [
+                'onboarding_token' => $_SESSION['onboarding_token'],
+                'code' => (string) ($_POST['code'] ?? ''),
+            ]));
+        } elseif ($action === 'verify_mfa' && isset($_SESSION['mfa_token'])) {
+            $page = 'mfa-login';
+            signedIn(api('POST', '/auth/mfa/verify', [
+                'mfa_token' => $_SESSION['mfa_token'], 'code' => (string) ($_POST['code'] ?? ''),
+            ]));
+        } elseif ($action === 'login') {
             $login = api('POST', '/auth/login', [
                 'email' => (string) ($_POST['email'] ?? ''),
                 'password' => (string) ($_POST['password'] ?? ''),
             ]);
-            if (!is_string($login['access_token'] ?? null)) {
-                throw new RuntimeException('Unexpected sign-in response.');
+            if (is_string($login['mfa_token'] ?? null)) {
+                $_SESSION = ['mfa_token' => $login['mfa_token'], 'csrf' => bin2hex(random_bytes(32)), 'last_seen' => time()];
+                session_regenerate_id(true);
+                header('Location: /public/?page=mfa-login');
+                exit;
             }
-            session_regenerate_id(true);
-            $_SESSION['access_token'] = $login['access_token'];
-            $_SESSION['csrf'] = bin2hex(random_bytes(32));
+            signedIn($login);
         } elseif ($action === 'logout') {
             try {
                 api('POST', '/auth/logout', []);
@@ -207,21 +341,92 @@ try {
 <main>
     <p><a href="/developers/api/v1/">Developer documentation</a></p>
     <?php if ($error !== ''): ?><p role="alert" class="error"><?= escape($error) ?></p><?php endif; ?>
-    <?php if (!isset($_SESSION['access_token'])): ?>
+    <?php if ($notice !== ''): ?><p role="status"><?= escape($notice) ?></p><?php endif; ?>
+    <?php if (!isset($_SESSION['access_token']) && $page === 'register'): ?>
+    <section>
+        <h2>Create your account</h2>
+        <p>You must be 13 or older to register. First, tell us about yourself. We will email an activation link so you can choose your username and password and secure your account.</p>
+        <?php if ($termsUrl === '' || $privacyUrl === ''): ?>
+        <p role="alert">Registration is temporarily unavailable. Contact camp staff.</p>
+        <?php else: ?>
+        <form method="post">
+            <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+            <input type="hidden" name="action" value="register">
+            <label>Name <input name="name" required autocomplete="name" maxlength="120"></label>
+            <label>Date of birth <input name="date_of_birth" type="date" required autocomplete="bday" min="1900-01-01" max="<?= escape($birthDateLimit->format('Y-m-d')) ?>"></label>
+            <label>Email address <input name="email" type="email" required autocomplete="email" maxlength="254"></label>
+            <label>Gender <select name="gender" required>
+                <option value="">Choose an option</option>
+                <option value="female">Female</option><option value="male">Male</option>
+                <option value="non_binary">Non-binary</option><option value="self_described">Self-described</option>
+                <option value="prefer_not_to_say">Prefer not to say</option>
+            </select></label>
+            <label class="consent"><input name="terms_accepted" type="checkbox" value="1" required> I agree to the <a href="<?= escape($termsUrl) ?>">terms of service</a>.</label>
+            <label class="consent"><input name="privacy_accepted" type="checkbox" value="1" required> I accept the <a href="<?= escape($privacyUrl) ?>">privacy policy</a>.</label>
+            <button type="submit">Register</button>
+        </form>
+        <?php endif; ?>
+        <p><a href="/public/">Already registered? Sign in</a></p>
+    </section>
+    <?php elseif (!isset($_SESSION['access_token']) && $page === 'profile'): ?>
+    <section>
+        <h2>Set up your profile</h2>
+        <?php if (!isset($_SESSION['activation_token']) && !isset($_SESSION['onboarding_token'])): ?>
+        <p>Open the activation link in your email to continue.</p>
+        <?php else: ?>
+        <form method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+            <input type="hidden" name="action" value="profile">
+            <input type="hidden" name="MAX_FILE_SIZE" value="262144">
+            <label>Profile picture (optional, JPEG or PNG, up to 256 KiB) <input name="profile_picture" type="file" accept="image/jpeg,image/png"></label>
+            <label>Username <input name="username" required autocomplete="username" minlength="3" maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{2,39}" aria-describedby="username-help"></label>
+            <p id="username-help">Use 3–40 letters, numbers, underscores, dots, or hyphens, starting with a letter or number.</p>
+            <label>Password <input name="password" type="password" required autocomplete="new-password" minlength="12" maxlength="1024"></label>
+            <label>Confirm password <input name="password_confirmation" type="password" required autocomplete="new-password" minlength="12" maxlength="1024"></label>
+            <button type="submit">Continue to MFA</button>
+        </form>
+        <?php endif; ?>
+    </section>
+    <?php elseif (!isset($_SESSION['access_token']) && $page === 'mfa' && isset($_SESSION['mfa_setup'])): ?>
+    <section>
+        <h2>Configure multi-factor authentication</h2>
+        <p>Add a time-based account in your authenticator app using this setup key. Keep it private.</p>
+        <pre><?= escape($_SESSION['mfa_setup']['mfa_secret'] ?? '') ?></pre>
+        <p>Account: your registration email address. Use six-digit codes, a 30-second interval, and SHA-1.</p>
+        <form method="post">
+            <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+            <input type="hidden" name="action" value="confirm_mfa">
+            <label>Authenticator code <input name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+            <button type="submit">Enable MFA and open dashboard</button>
+        </form>
+    </section>
+    <?php elseif (!isset($_SESSION['access_token']) && $page === 'mfa-login' && isset($_SESSION['mfa_token'])): ?>
+    <section>
+        <h2>Verify your sign in</h2>
+        <form method="post">
+            <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
+            <input type="hidden" name="action" value="verify_mfa">
+            <label>Authenticator code <input name="code" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6"></label>
+            <button type="submit">Open dashboard</button>
+        </form>
+    </section>
+    <?php elseif (!isset($_SESSION['access_token']) && $page === 'check-email'): ?>
+    <section><h2>Check your email</h2><p>Follow your activation link to complete your profile and configure MFA.</p><p><a href="/public/">Return to sign in</a></p></section>
+    <?php elseif (!isset($_SESSION['access_token'])): ?>
     <section>
         <h2>Staff &amp; guest sign in</h2>
-        <p>Use the account provided by your administrator. Access is limited to your assigned groups and records.</p>
+        <p>Access is limited to your assigned groups and records. <a href="/public/?page=register">Register a new account</a>.</p>
         <form method="post">
             <input type="hidden" name="csrf" value="<?= escape($_SESSION['csrf']) ?>">
             <input type="hidden" name="action" value="login">
-            <label>Email <input name="email" type="email" required autocomplete="username" maxlength="254"></label>
+            <label>Email or username <input name="email" required autocomplete="username" maxlength="254"></label>
             <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
             <button type="submit">Sign in securely</button>
         </form>
     </section>
     <?php elseif ($me !== null): ?>
     <section>
-        <h2>Your access</h2>
+        <h2>Your dashboard</h2>
         <p>Signed in as <?= escape($me['user']['display_name'] ?? $me['user']['email'] ?? '') ?>.</p>
         <ul><?php foreach ($me['groups'] ?? [] as $group): ?><li><?= escape($group['name']) ?></li><?php endforeach; ?></ul>
         <form method="post">
